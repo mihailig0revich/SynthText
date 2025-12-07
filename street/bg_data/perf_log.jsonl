@@ -1,1 +1,0 @@
-{"index": 0, "name": "0060_Image19.jpg", "seg_mode": "felz_turbo", "midas_model": "MiDaS_small", "device": "cuda", "H": 1600, "W": 2560, "ram_mb": -1.0, "cuda_current_mb": 82.69189453125, "cuda_reserved_mb": 144.0, "cuda_max_allocated_mb": 108.0791015625, "total_s": 88.85667310003191}
