@@ -28,7 +28,6 @@ var/
 .installed.cfg
 *.egg
 results_png/
-data/*
 !data/.r
 debug_steps
 street/bg_data/img
