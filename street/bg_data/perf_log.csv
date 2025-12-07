@@ -1,0 +1,2 @@
+index,name,seg_mode,midas_model,device,H,W,ram_mb,cuda_current_mb,cuda_reserved_mb,cuda_max_allocated_mb,total_s
+0,0060_Image19.jpg,felz_turbo,MiDaS_small,cuda,1600,2560,-1.0,82.69189453125,144.0,108.0791015625,88.85667310003191

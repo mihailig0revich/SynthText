@@ -1,0 +1,123 @@
+--- a/SynthText-python3/synthgen.py
++++ b/SynthText-python3/synthgen.py
+@@ -1,27 +1,31 @@
+ # Author: Ankush Gupta
+ # Date: 2015
+ 
+ """
+ Main script for synthetic text rendering.
+ """
+ 
+ from __future__ import division
+ import copy
+-import cv2 as cv
++import cv2 as cv
+ import h5py
+ from PIL import Image
+ #import mayavi.mlab as mym
+ import matplotlib.pyplot as plt 
+ import os.path as osp
+ import scipy.ndimage as sim
+ import scipy.spatial.distance as ssd
+ import synth_utils as su
+ import text_utils as tu
+ from colorize3_poisson import Colorize
+ from common import *
+-import traceback, itertools
+-import numpy as np
++import traceback
++import itertools
++import math
++import re
++import time
++import numpy as np
+ 
+ # --- OpenCV aliases (поддерживаем и cv2, и cv) ---
+ try:
+     import cv2
+ except Exception as e:
+     raise
+@@ -54,7 +58,6 @@
+ DEBUG = True
+ 
+ # ==== DEBUG UTILS (вставить рядом с импортами, один раз) ====
+-import os, time
+ def _dbg_dir():
+     d = "debug_steps"
+     os.makedirs(d, exist_ok=True)
+@@ -172,6 +175,7 @@
+     return int(np.ceil(need_h)), int(np.ceil(need_w))
+ 
+ def region_can_fit_rect(forbidden_mask: np.ndarray, need_h: int, need_w: int, step: int = 3):
+     """Версия на интегральных изображениях: O(1) на окно, скан с шагом."""
+     free255 = (forbidden_mask == 0).astype(np.uint8) * 255
+     ok, _ = any_fit_with_integral(free255, need_h, need_w, step=step)
+     return ok, 1 if ok else 0  # score больше не считаем — ранний выход
+@@ -233,8 +237,6 @@
+ 
+ # ==== FAST FIT UTILS ====
+-import time
+-
+ _KERNEL_CACHE = {}  # если потом захочешь кэшировать ядра морфологии
+ 
+ def ii_from_free(free_bin255: np.ndarray):
+     # free_bin255: 255 на свободных, 0 на запретах
+@@ -311,7 +313,6 @@
+     f_final = max(lo, f_best)
+     return ireg_best, float(f_final)
+ 
+-import numpy as np
+ def _warp_points(Hinv, pts_xy):
+     """pts_xy: (N,2) в FP -> (N,2) в IMG"""
+     pts = np.concatenate([pts_xy.astype(np.float32), np.ones((len(pts_xy),1), np.float32)], axis=1).T  # 3xN
+@@ -547,26 +548,6 @@
+         return regions
+     
+-    def _bbox_from_mask(self, mask):
+-        """Возвращает (x_min, y_min, x_max, y_max) или None, если маска пуста."""
+-        import numpy as np
+-        if mask is None:
+-            return None
+-        m = (mask > 0).astype(np.uint8)
+-        ys, xs = np.where(m)
+-        if xs.size == 0 or ys.size == 0:
+-            return None
+-        return int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max())
+-
+-
+     def _draw_debug_bbox_or_bg(self, rgb, bbox, *, use_bg=False, pad=5,
+                             bg_color=(255, 255, 255), alpha=0.55,
+                             rect_color=(0, 0, 255), rect_thickness=2):
+         """
+         Либо рисует контур bbox (use_bg=False), либо заливает полупрозрачным фоном (use_bg=True).
+         Возвращает модифицированную копию rgb.
+         """
+-        import numpy as np, cv2
+-
+         if bbox is None:
+             return rgb
+@@ -594,8 +575,6 @@
+     
+     def try_place_once(self, rgb, collision_mask, H, Hinv, font, f_h_px,
+                     text_resample_tries=8, txt_override=None):
+         """
+         Одна попытка разместить текст внутри конкретного rectified-региона.
+         Если txt_override != None — рисуем ровно этот текст (без семплинга).
+         Возвращает (im_final, txt_str, bb_img, updated_collision, text_mask_img)
+         или None.
+         """
+-        import numpy as np, cv2, re
+-
+         f_asp = self.text_renderer.font_state.get_aspect_ratio(font)
+         nline, nchar = self.text_renderer.get_nline_nchar(
+             collision_mask.shape[:2], f_h_px, f_h_px * f_asp
+@@ -855,8 +834,6 @@
+ 
+     def char2wordBB(self, charBB, text,
+                     pad_px=0, pad_rel=0.0, clamp_shape=None,
+                     offset_xy=(0, 0), offset_rel=(0.0, 0.0), offset_mode="image"):
+-        
+-        import numpy as np, cv2, itertools, math
+ 
+         wrds = text.split()
+         bb_idx = np.r_[0, np.cumsum([len(w) for w in wrds])]

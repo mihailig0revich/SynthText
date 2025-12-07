@@ -5,6 +5,7 @@ __pycache__/
 *$py.class
 *.h5
 *.zip
+*.pt
 
 # C extensions
 *.so
