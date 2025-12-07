@@ -39,22 +39,22 @@ except Exception:
     RESAMPLE_NEAREST = getattr(Image, 'NEAREST', Image.BILINEAR)
 
 # ------------------------- Configuration -------------------------
-NUM_IMG = -1
+NUM_IMG = -1              # -1 = все
 INSTANCE_PER_IMAGE = 1
 SECS_PER_IMG = 5
 
-# Папка, откуда берём входные .h5 с бэкграундами
+# Папка, откуда берём входные .h5
 INPUT_DIR = r"C:\code\SynthText-python3\input"
 
-# (опциональный) старый путь по умолчанию, если в INPUT_DIR нет .h5
+# Резервный старый путь (если в INPUT_DIR не окажется ни одного .h5)
 DB_FNAME = r"C:\code\SynthText-python3\street\bg_data\bg_data.h5"
 
 # Папка с ресурсами для текста (корпус + шрифты)
 RENDER_DATA_PATH = r"C:\code\SynthText-python3\data"
 
-# Базовый путь для выходного H5
+# Пути для сохранения
 OUT_FILE = 'results/SynthText.h5'
-
+PNG_DIR  = 'results_png'   # <<< вот её как раз и не хватало
 MAX_GLOBAL_TRIES = 8
 
 # NEW: лимит размера одного выходного H5-файла (в гигабайтах)
@@ -90,14 +90,25 @@ def list_input_h5_files(input_dir=INPUT_DIR, fallback=DB_FNAME):
     )
 
 
-def get_data(h5_path):
-    """Открывает конкретный .h5-файл и печатает его верхнеуровневые ключи."""
+def get_data(h5_path=None):
+    """
+    Открывает HDF5-файл и возвращает объект h5py.File.
+
+    h5_path:
+      - если задан, открывается именно этот путь;
+      - если None, используется DB_FNAME (старое поведение).
+    """
+    if h5_path is None:
+        h5_path = DB_FNAME
+
     if not osp.exists(h5_path):
-        raise FileNotFoundError(f"Не найден {h5_path}")
+        raise FileNotFoundError(f"Не найден HDF5-файл: {h5_path}")
+
     db = h5py.File(h5_path, 'r')
-    print(f"[H5] open: {h5_path}")
+    print("[H5] open:", h5_path)
     print("[H5] top-level keys:", list(db.keys()))
     return db
+
 
 
 def clean_depth_and_seg(depth, seg):
@@ -124,16 +135,6 @@ def clean_depth_and_seg(depth, seg):
         depth = np.clip(depth, 1.0, hi)
 
     return depth, seg
-
-
-def get_data():
-    """Открывает локальный dset.h5"""
-    if not osp.exists(DB_FNAME):
-        raise FileNotFoundError(f"Не найден {DB_FNAME}")
-    db = h5py.File(DB_FNAME, 'r')
-    print("[H5] top-level keys:", list(db.keys()))
-    return db
-
 
 def pick_group(db, candidates):
     """Возвращает (group, выбранное_имя) из списка возможных имён."""
@@ -359,16 +360,18 @@ def main(viz=False):
                     res = RV3.render_text(
                         img, depth, seg, area, label,
                         ninstance=INSTANCE_PER_IMAGE,
-                        viz=viz
+                        viz=viz,
                     )
+
                     if res and len(res) > 0 and isinstance(res[0].get('img', []), np.ndarray):
+                        # сохраняем ТОЛЬКО в H5
                         add_res_to_db(imname, res, out_db)
 
-                        # PNG можно убрать, если хочешь только H5
-                        png_path = osp.join(PNG_DIR, f"{imname}_{attempt:02d}.png")
-                        _save_png_rgb(png_path, res[0]['img'])
-                        print(colorize(Color.GREEN, f"[OK] saved {png_path}", bold=True))
-
+                        print(colorize(
+                            Color.GREEN,
+                            f"[OK] saved {len(res)} instance(s) for '{imname}' into H5 (attempt {attempt})",
+                            bold=True
+                        ))
                         saved_any = True
                         break
                     else:
