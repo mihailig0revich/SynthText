@@ -129,36 +129,74 @@ def ensure_proj_z(plane_coeffs, min_z_proj):
         return coeffs
     return plane_coeffs
 
-def isplanar(xyz,sample_neighbors,dist_thresh,num_inliers,z_proj):
+def isplanar(xyz, sample_neighbors, dist_thresh, num_inliers, z_proj):
     """
     Checks if at-least FRAC_INLIERS fraction of points of XYZ (nx3)
     points lie on a plane. The plane is fit using RANSAC.
 
     XYZ : (nx3) array of 3D point coordinates
     SAMPLE_NEIGHBORS : 5xN_RANSAC_TRIALS neighbourhood array
-                       of indices into the XYZ array. i.e. the values in this
-                       matrix range from 0 to number of points in XYZ
-    DIST_THRESH (default = 10cm): a point pt is an inlier iff dist(plane-pt)<dist_thresh
-    FRAC_INLIERS : fraction of total-points which should be inliers to
-                   to declare that points are planar.
-    Z_PROJ : changes the surface normal, so that its projection on z axis is ATLEAST z_proj.
+                       of indices into the XYZ array.
+    DIST_THRESH : a point pt is an inlier iff dist(plane-pt)<dist_thresh
+    NUM_INLIERS : либо доля [0,1], либо минимальное количество инлаеров.
+    Z_PROJ : минимальная проекция нормали на ось z.
 
     Returns:
         None, if the data is not planar, else a 4-tuple of plane coeffs.
     """
-    frac_inliers = num_inliers/xyz.shape[0]
-    dv = -np.percentile(xyz,50,axis=0) # align the normal to face towards camera
-    max_iter = sample_neighbors.shape[-1]
-    plane_info =  fit_plane_ransac(xyz,neighbors=sample_neighbors,
-                            z_pos=dv,dist_inlier=dist_thresh,
-                            min_inlier_frac=frac_inliers,nsample=20,
-                            max_iter=max_iter) 
-    if plane_info != None:
-        coeff, inliers = plane_info
-        coeff = ensure_proj_z(coeff, z_proj)
-        return coeff,inliers
+    import numpy as np
+
+    xyz = np.asarray(xyz, dtype=np.float64)
+    if xyz.ndim != 2 or xyz.shape[1] != 3:
+        return
+
+    # чистим NaN/Inf
+    if not np.isfinite(xyz).all():
+        xyz = np.nan_to_num(xyz, nan=0.0, posinf=0.0, neginf=0.0)
+
+    N = xyz.shape[0]
+    if N < 10:
+        # слишком мало точек, чтобы уверенно фитить плоскость
+        return
+
+    # интерпретируем num_inliers:
+    # - если <=1.0, считаем, что это уже доля;
+    # - если >1.0, считаем, что это минимальное число инлаеров.
+    frac_inliers = float(num_inliers)
+    if frac_inliers <= 1.0:
+        pass  # уже доля
     else:
-        return #None
+        frac_inliers = frac_inliers / float(N)
+
+    # не даём доле уйти в 0.0 или 1.0
+    frac_inliers = float(np.clip(frac_inliers, 0.1, 0.9))
+
+    # выравниваем нормаль в сторону камеры
+    dv = -np.percentile(xyz, 50, axis=0)
+
+    max_iter = int(sample_neighbors.shape[-1])
+
+    try:
+        plane_info = fit_plane_ransac(
+            xyz,
+            neighbors=sample_neighbors,
+            z_pos=dv,
+            dist_inlier=dist_thresh,
+            min_inlier_frac=frac_inliers,
+            nsample=20,
+            max_iter=max_iter
+        )
+    except Exception:
+        # тут раньше всё и падало -> просто говорим "непланарно"
+        return
+
+    if plane_info is None:
+        return
+
+    coeff, inliers = plane_info
+    coeff = ensure_proj_z(coeff, z_proj)
+    return coeff, inliers
+
 
 
 class DepthCamera(object):
@@ -189,17 +227,31 @@ class DepthCamera(object):
     @staticmethod
     def depth2xyz(depth):
         """
-        Convert a HxW depth image (float, in meters)
+        Convert a HxW depth image (float, arbitrary units)
         to XYZ (HxWx3).
 
         y is along the height.
         x is along the width.
         """
-        H,W = depth.shape
-        xx,yy = np.meshgrid(np.arange(W),np.arange(H))
-        X = (xx-W/2) * depth / DepthCamera.f
-        Y = (yy-H/2) * depth / DepthCamera.f
-        return np.dstack([X,Y,depth.copy()])
+        import numpy as np
+
+        depth = np.asarray(depth, dtype=np.float32)
+
+        # убираем NaN/Inf, которые валят RANSAC и всё остальное
+        depth = np.nan_to_num(depth, nan=0.0, posinf=0.0, neginf=0.0)
+
+        H, W = depth.shape
+        xx, yy = np.meshgrid(
+            np.arange(W, dtype=np.float32),
+            np.arange(H, dtype=np.float32)
+        )
+
+        X = (xx - W / 2.0) * depth / float(DepthCamera.f)
+        Y = (yy - H / 2.0) * depth / float(DepthCamera.f)
+
+        xyz = np.dstack([X, Y, depth.copy()]).astype(np.float32)
+        xyz[~np.isfinite(xyz)] = 0.0
+        return xyz
 
     @staticmethod
     def overlay(rgb, depth):

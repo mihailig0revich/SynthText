@@ -180,35 +180,68 @@ def warp_perspective_with_depth(
 ):
     """
     Добавляет перспективный эффект к изображению, используя карту глубины.
-    rgb:   HxWx3, uint8 (RGB или BGR - без разницы, геометрия только)
-    depth: HxW, float32
+
+    rgb   : HxWx3 или WxHx3, uint8 (RGB/BGR — геометрии всё равно)
+    depth : HxW, float32
     """
+    import numpy as np
+    import cv2
+
     rgb = np.asarray(rgb)
     depth = np.asarray(depth)
 
-    H, W = rgb.shape[:2]
+    # --- depth приводим к 2D HxW и считаем эталонным размером ---
+    if depth.ndim == 3:
+        depth = depth.squeeze()
+    if depth.ndim != 2:
+        raise ValueError(f"depth должен быть 2D, а не {depth.shape}")
+
+    H_d, W_d = depth.shape
+
+    # --- rgb к 3 каналам ---
+    if rgb.ndim == 2:
+        rgb = cv2.cvtColor(rgb.astype(np.uint8), cv2.COLOR_GRAY2BGR)
+    if rgb.ndim != 3 or rgb.shape[2] != 3:
+        raise ValueError(f"rgb должен быть HxWx3, а не {rgb.shape}")
+
+    H_i, W_i = rgb.shape[:2]
+
+    # --- Согласование размеров rgb и depth ---
+    if (H_i, W_i) != (H_d, W_d):
+        # Классический pygame-кейс: rgb (W, H, 3), depth (H, W)
+        if (W_i, H_i) == (H_d, W_d):
+            # приводим rgb к (H, W, 3)
+            rgb = np.swapaxes(rgb, 0, 1).copy()
+            H_i, W_i = rgb.shape[:2]
+        else:
+            raise ValueError(
+                f"warp_perspective_with_depth: несовместимые формы "
+                f"rgb={rgb.shape}, depth={depth.shape}"
+            )
+
+    H, W = H_d, W_d
     cx = W * 0.5
     cy = H * 0.5
 
-    # фокус по FOV
+    # --- фокус по FOV ---
     f = 0.5 * W / np.tan(np.deg2rad(fov_deg) * 0.5)
     fx = fy = float(f)
 
-    # Z из глубины
+    # --- Z из глубины ---
     Z = depth_to_z(depth, near=depth_near, far=depth_far, invert=invert_depth)
 
-    # сетка пикселей
+    # --- сетка пикселей ---
     u, v = np.meshgrid(
         np.arange(W, dtype=np.float32),
         np.arange(H, dtype=np.float32),
     )
 
-    # из пикселей в 3D
+    # --- из пикселей в 3D ---
     X = (u - cx) * Z / fx
     Y = (v - cy) * Z / fy
     pts = np.stack([X, Y, Z], axis=-1).reshape(-1, 3).T  # (3, N)
 
-    # поворот сцены
+    # --- поворот сцены ---
     R = euler_to_R(yaw_deg=yaw_deg, pitch_deg=pitch_deg, roll_deg=roll_deg)
     pts2 = R @ pts
     X2, Y2, Z2 = pts2[0, :], pts2[1, :], pts2[2, :]
@@ -216,7 +249,7 @@ def warp_perspective_with_depth(
     eps = 1e-4
     Z2 = np.maximum(Z2, eps)
 
-    # обратно в пиксели
+    # --- обратно в пиксели ---
     u2 = fx * (X2 / Z2) + cx
     v2 = fy * (Y2 / Z2) + cy
 
@@ -232,6 +265,8 @@ def warp_perspective_with_depth(
         borderValue=(0, 0, 0),
     )
     return warped
+
+
 
 
 def get_placeable_mask(seg, min_area=100):
@@ -302,14 +337,31 @@ def color_contrast(a, b):
 
 def choose_contrast_color(bg_rgb, min_contrast=0.4):
     """
-    Возвращает цвет текста (RGB 0–1), контрастный к bg_rgb.
+    Возвращает цвет текста (RGB 0–1), контрастный к bg_rgb и достаточно яркий.
+
+    bg_rgb: np.array длиной 3 в диапазоне [0,1].
     """
     import numpy as np
+    import colorsys
+
+    bg = np.asarray(bg_rgb, dtype=np.float32).clip(0.0, 1.0)
+
+    # Пытаемся подобрать яркий цвет в HSV с хорошей насыщенностью/яркостью
     for _ in range(50):
-        txt_rgb = np.random.rand(3)
-        if color_contrast(bg_rgb, txt_rgb) >= min_contrast:
+        h = np.random.rand()
+        s = np.random.uniform(0.6, 1.0)   # насыщенный
+        v = np.random.uniform(0.8, 1.0)   # яркий
+        txt_rgb = np.array(colorsys.hsv_to_rgb(h, s, v), dtype=np.float32)
+
+        if color_contrast(bg, txt_rgb) >= min_contrast:
             return txt_rgb
-    # fallback — инвертируем
+
+    # fallback — инвертируем фон
+    inv = 1.0 - bg
+    if color_contrast(bg, inv) < min_contrast:
+        # максимально «жёсткий» контраст: чёрно-белое по компонентам
+        inv = np.where(bg < 0.5, 1.0, 0.0).astype(np.float32)
+    return invсв
 
 def _save_mask(name, m):
     import numpy as _np
@@ -539,20 +591,24 @@ class TextRegions(object):
     Get region from segmentation which are good for placing
     text.
     """
-    minAspect = 0.3 # w > 0.3*h
+    minAspect = 0.3  # w > 0.3*h
     maxAspect = 7
-    minArea = 100 # number of pix
-    minWidth  = 24      # было 30
-    minHeight = 24      # было 30
-    pArea     = 0.55
+    minArea = 100  # number of pix
+    minWidth = 24      # было 30
+    minHeight = 24     # было 30
+    pArea = 0.55
 
     # RANSAC planar fitting params:
-    dist_thresh = 0.10 # m
-    num_inlier = 90
-    ransac_fit_trials = 100
-    min_z_projection = 0.25
+    dist_thresh = 0.30        # было 0.20/0.10 — допускаем дальше от плоскости
+    num_inlier = 25           # было 40/90  — требуем меньше инлаеров
+    ransac_fit_trials = 80    # немного больше итераций, чтобы что-то нашёл
+    min_z_projection = 0.05   # было 0.15 — почти любую «фронтальную» нормаль пускаем
 
     minW = 16
+
+    # <<< НОВОЕ: ограничиваем число регионов, куда полезем с RANSAC и плоскостями >>>
+    maxRegionsForPlaneFit = 15  # максимум регионов после TextRegions.filter
+    maxPlaneTrials = 15         # максимум регионов в TextRegions.filter_depth
 
     @staticmethod
     def filter_rectified(mask):
@@ -565,41 +621,47 @@ class TextRegions(object):
         return (wx > TextRegions.minW * 0.8) and (wy > TextRegions.minW * 0.6)
 
     @staticmethod
-    def get_hw(pt,return_rot=False):
+    def get_hw(pt, return_rot=False):
         pt = pt.copy()
         R = su.unrotate2d(pt)
-        mu = np.median(pt,axis=0)
-        pt = (pt-mu[None,:]).dot(R.T) + mu[None,:]
-        h,w = np.max(pt,axis=0) - np.min(pt,axis=0)
+        mu = np.median(pt, axis=0)
+        pt = (pt - mu[None, :]).dot(R.T) + mu[None, :]
+        h, w = np.max(pt, axis=0) - np.min(pt, axis=0)
         if return_rot:
-            return h,w,R
-        return h,w
- 
+            return h, w, R
+        return h, w
+
     @staticmethod
-    def filter(seg,area,label):
+    def filter(seg, area, label):
         """
         Apply the filter.
         The final list is ranked by area.
         """
         good = label[area > TextRegions.minArea]
         area = area[area > TextRegions.minArea]
-        filt,R = [],[]
-        for idx,i in enumerate(good):
-            mask = seg==i
-            xs,ys = np.where(mask)
+        filt, R = [], []
+        for idx, i in enumerate(good):
+            mask = (seg == i)
+            xs, ys = np.where(mask)
 
-            coords = np.c_[xs,ys].astype('float32')
-            rect = cv2.minAreaRect(coords)          
-            #box = np.array(cv2.cv.BoxPoints(rect))
+            coords = np.c_[xs, ys].astype('float32')
+            rect = cv2.minAreaRect(coords)
+            # box = np.array(cv2.cv.BoxPoints(rect))
             box = np.array(cv2.boxPoints(rect))
-            h,w,rot = TextRegions.get_hw(box,return_rot=True)
+            h, w, rot = TextRegions.get_hw(box, return_rot=True)
+
+            # --- мягкий фильтр по аспект-ратио (как раньше, но порог выше) ---
+            # Очень вытянутые регионы (узкие полоски / линии) отбрасываем.
+            # aspect >= 1, чем больше — тем более вытянутый регион.
+            aspect = max(float(h) / max(float(w), 1.0),
+                         float(w) / max(float(h), 1.0))
 
             rect_area = max(1.0, float(w) * float(h))
             f = (
-                h > TextRegions.minHeight * 0.8 and          # было жестче
-                w > TextRegions.minWidth  * 0.8 and
-                TextRegions.minAspect < (w / max(h, 1e-6)) < TextRegions.maxAspect and
-                (float(area[idx]) / rect_area) >= (TextRegions.pArea * 0.85)  # было 0.60 → станет 0.51
+                h > TextRegions.minHeight * 0.8 and          # немного смягчили порог
+                w > TextRegions.minWidth * 0.8 and
+                (float(area[idx]) / rect_area) >= (TextRegions.pArea * 0.85) and  # чуть мягче
+                aspect < 18.0                                # <-- мягкий порог по аспект-ратио
             )
             filt.append(f)
             R.append(rot)
@@ -611,77 +673,239 @@ class TextRegions(object):
 
         # sort the regions based on areas:
         aidx = np.argsort(-area)
-        good = good[filt][aidx]
-        R = [R[i] for i in aidx]
-        filter_info = {'label':good, 'rot':R, 'area': area[aidx]}
+
+        # --- НОВОЕ: ограничиваем число регионов, с которыми пойдём дальше ---
+        good_sorted = good[filt][aidx]
+        R_sorted = [R[i] for i in aidx]
+        area_sorted = area[aidx]
+
+        maxN = getattr(TextRegions, "maxRegionsForPlaneFit", None)
+        if maxN is not None and maxN > 0 and len(good_sorted) > maxN:
+            good_sorted = good_sorted[:maxN]
+            R_sorted = R_sorted[:maxN]
+            area_sorted = area_sorted[:maxN]
+
+        filter_info = {'label': good_sorted, 'rot': R_sorted, 'area': area_sorted}
         return filter_info
 
     @staticmethod
-    def sample_grid_neighbours(mask,nsample,step=3):
+    def sample_grid_neighbours(mask, nsample, step=3):
         """
         Given a HxW binary mask, sample 4 neighbours on the grid,
         in the cardinal directions, STEP pixels away.
         """
-        if 2*step >= min(mask.shape[:2]):
-            return #None
+        if 2 * step >= min(mask.shape[:2]):
+            return  # None
 
-        y_m,x_m = np.where(mask)
-        mask_idx = np.zeros_like(mask,'int32')
+        y_m, x_m = np.where(mask)
+        mask_idx = np.zeros_like(mask, 'int32')
         for i in range(len(y_m)):
-            mask_idx[y_m[i],x_m[i]] = i
+            mask_idx[y_m[i], x_m[i]] = i
 
-        xp,xn = np.zeros_like(mask), np.zeros_like(mask)
-        yp,yn = np.zeros_like(mask), np.zeros_like(mask)
-        xp[:,:-2*step] = mask[:,2*step:]
-        xn[:,2*step:] = mask[:,:-2*step]
-        yp[:-2*step,:] = mask[2*step:,:]
-        yn[2*step:,:] = mask[:-2*step,:]
-        valid = mask&xp&xn&yp&yn
+        xp, xn = np.zeros_like(mask), np.zeros_like(mask)
+        yp, yn = np.zeros_like(mask), np.zeros_like(mask)
+        xp[:, :-2 * step] = mask[:, 2 * step:]
+        xn[:, 2 * step:] = mask[:, :-2 * step]
+        yp[:-2 * step, :] = mask[2 * step:, :]
+        yn[2 * step:, :] = mask[:-2 * step, :]
+        valid = mask & xp & xn & yp & yn
 
-        ys,xs = np.where(valid)
+        ys, xs = np.where(valid)
         N = len(ys)
-        if N==0: #no valid pixels in mask:
-            return #None
-        nsample = min(nsample,N)
-        idx = np.random.choice(N,nsample,replace=False)
+        if N == 0:  # no valid pixels in mask:
+            return  # None
+        nsample = min(nsample, N)
+        idx = np.random.choice(N, nsample, replace=False)
         # generate neighborhood matrix:
         # (1+4)x2xNsample (2 for y,x)
-        xs,ys = xs[idx],ys[idx]
+        xs, ys = xs[idx], ys[idx]
         s = step
-        X = np.transpose(np.c_[xs,xs+s,xs+s,xs-s,xs-s][:,:,None],(1,2,0))
-        Y = np.transpose(np.c_[ys,ys+s,ys-s,ys+s,ys-s][:,:,None],(1,2,0))
-        sample_idx = np.concatenate([Y,X],axis=1)
-        mask_nn_idx = np.zeros((5,sample_idx.shape[-1]),'int32')
+        X = np.transpose(np.c_[xs, xs + s, xs + s, xs - s, xs - s][:, :, None], (1, 2, 0))
+        Y = np.transpose(np.c_[ys, ys + s, ys - s, ys + s, ys - s][:, :, None], (1, 2, 0))
+        sample_idx = np.concatenate([Y, X], axis=1)
+        mask_nn_idx = np.zeros((5, sample_idx.shape[-1]), 'int32')
         for i in range(sample_idx.shape[-1]):
-            mask_nn_idx[:,i] = mask_idx[sample_idx[:,:,i][:,0],sample_idx[:,:,i][:,1]]
+            mask_nn_idx[:, i] = mask_idx[sample_idx[:, :, i][:, 0], sample_idx[:, :, i][:, 1]]
         return mask_nn_idx
 
     @staticmethod
-    def filter_depth(xyz,seg,regions):
-        plane_info = {'label':[],
-                      'coeff':[],
-                      'support':[],
-                      'rot':[],
-                      'area':[]}
-        for idx,l in enumerate(regions['label']):
-            mask = seg==l
-            pt_sample = TextRegions.sample_grid_neighbours(mask,TextRegions.ransac_fit_trials,step=3)
-            if pt_sample is None:
-                continue #not enough points for RANSAC
-            # get-depths
-            pt = xyz[mask]
-            plane_model = su.isplanar(pt, pt_sample,
-                                     TextRegions.dist_thresh,
-                                     TextRegions.num_inlier,
-                                     TextRegions.min_z_projection)
-            if plane_model is not None:
-                plane_coeff = plane_model[0]
-                if np.abs(plane_coeff[2])>TextRegions.min_z_projection:
-                    plane_info['label'].append(l)
-                    plane_info['coeff'].append(plane_model[0])
-                    plane_info['support'].append(plane_model[1])
-                    plane_info['rot'].append(regions['rot'][idx])
-                    plane_info['area'].append(regions['area'][idx])
+    def filter_depth(xyz, seg, regions, max_planes=6):
+        """
+        Выбираем несколько (до max_planes) планарных регионов, стараясь
+        отбрасывать "небо", но делаем RANSAC мягче.
+
+        regions: словарь после get_regions:
+          - 'label': метки сегментов
+          - 'area' : площади
+          - 'rot'  : повороты (опц.)
+
+        Возвращает словарь с полями:
+          'label', 'area', 'coeff', 'inliers', 'rot'
+        — по структуре совместим с остальным кодом.
+        """
+        import numpy as np
+
+        xyz = np.asarray(xyz, dtype=np.float32)
+        seg = np.asarray(seg, dtype=np.int32)
+
+        labels = np.asarray(regions.get("label", []), dtype=np.int32)
+        areas = np.asarray(regions.get("area", []), dtype=np.float32)
+        rots = regions.get("rot", [None] * len(labels))
+
+        plane_info = {
+            'label': [],
+            'coeff': [],
+            'inliers': [],
+            'area': [],
+            'rot': [],
+        }
+
+        if labels.size == 0:
+            return plane_info
+
+        # --- сортируем по площади: сначала самые большие ---
+        order = np.argsort(-areas)
+        labels = labels[order]
+        areas = areas[order]
+        rots = [rots[i] for i in order]
+
+        H, W = seg.shape[:2]
+        total_px = float(H * W)
+
+        def is_sky_like(lbl, area_px):
+            """Эвристика: большой, верхний, широкий регион = похоже на небо."""
+            mask = (seg == int(lbl))
+            ys, xs = np.where(mask)
+            if ys.size == 0:
+                return False
+
+            area_frac = float(area_px) / max(total_px, 1.0)
+
+            y_min, y_max = ys.min(), ys.max()
+            x_min, x_max = xs.min(), xs.max()
+
+            h_frac = float(y_max - y_min + 1) / max(H, 1)
+            w_frac = float(x_max - x_min + 1) / max(W, 1)
+            y_center_frac = (0.5 * (y_min + y_max)) / max(H, 1)
+
+            cond_area = area_frac >= 0.18      # достаточно большой кусок
+            cond_top = y_center_frac <= 0.38   # явно верх кадра
+            cond_wide = w_frac >= 0.45         # широкий по X
+            cond_not_too_tall = h_frac <= 0.75 # не во всю высоту
+
+            if cond_area and cond_top and cond_wide and cond_not_too_tall:
+                print(
+                    f"[filter_depth] skip label={int(lbl)} as sky-like: "
+                    f"area={area_frac:.3f}, y_center={y_center_frac:.2f}, "
+                    f"w={w_frac:.2f}, h={h_frac:.2f}"
+                )
+                return True
+            return False
+
+        # --- НОВОЕ: ограничение на число регионов, для которых вообще запускаем RANSAC ---
+        max_trials = getattr(TextRegions, "maxPlaneTrials", None)
+
+        # --- перебираем регионы по убыванию площади ---
+        for idx, (lbl, a, r) in enumerate(zip(labels, areas, rots)):
+            if len(plane_info['label']) >= max_planes:
+                break
+
+            if (max_trials is not None) and (idx >= int(max_trials)):
+                print(f"[filter_depth] reached maxPlaneTrials={max_trials}, stop scanning regions")
+                break
+
+            # сначала выкидываем явно "небоподобные" регионы
+            if is_sky_like(lbl, a):
+                continue
+
+            reg_mask = (seg == int(lbl))
+            if not np.any(reg_mask):
+                continue
+
+            pt = xyz[reg_mask]      # (N, 3)
+            n_pt = pt.shape[0]
+
+            # более мягкое условие по числу точек
+            if n_pt < 25:
+                # совсем микроскопические регионы не трогаем
+                continue
+
+            # соседства для RANSAC: сначала по сетке, если не получилось — рандом
+            nn_idx = TextRegions.sample_grid_neighbours(
+                reg_mask,
+                TextRegions.ransac_fit_trials
+            )
+            if nn_idx is None:
+                nn_idx = np.random.randint(
+                    0, n_pt,
+                    size=(5, TextRegions.ransac_fit_trials),
+                    dtype=np.int32
+                )
+
+            # адаптивное число инлаеров: не фиксированное, а доля от n_pt
+            min_inlier = max(15, int(0.30 * n_pt))  # ≥15, но не требуем половину точек
+
+            plane_model = su.isplanar(
+                pt,
+                nn_idx,
+                TextRegions.dist_thresh,
+                min_inlier,
+                TextRegions.min_z_projection
+            )
+
+            # fallback: если RANSAC не смог — пробуем LS-плоскость по всем точкам
+            if plane_model is None:
+                print(f"[filter_depth] RANSAC failed for label={int(lbl)}, trying LS fallback")
+                try:
+                    X = np.c_[pt[:, 0], pt[:, 1], np.ones(pt.shape[0])]
+                    y = -pt[:, 2]
+                    coeff_ls, _, _, _ = np.linalg.lstsq(X, y, rcond=None)
+                    a_c, b_c, d_c = coeff_ls
+                    c_c = 1.0
+                    coeff = np.array([a_c, b_c, c_c, d_c], dtype=np.float32)
+                    inliers = np.arange(pt.shape[0], dtype=np.int32)
+                    plane_model = (coeff, inliers)
+                    print(f"[filter_depth] LS-plane accepted for label={int(lbl)}")
+                except Exception as e:
+                    print(f"[filter_depth] LS fallback failed for label={int(lbl)}:", repr(e))
+                    continue
+
+            coeff, inliers = plane_model
+
+            # мягкий фильтр по нормали: только логируем очень "плоские" по Z плоскости,
+            # но не отбрасываем их жёстко
+            if np.abs(coeff[2]) <= (TextRegions.min_z_projection * 0.5):
+                print(
+                    f"[filter_depth] label={int(lbl)} has weak z-normal: "
+                    f"coeff={coeff}"
+                )
+                # НЕ делаем continue — всё равно принимаем плоскость
+
+            # успешный кандидат — сохраняем, но НЕ выходим из цикла
+            plane_info['label'].append(int(lbl))
+            plane_info['coeff'].append(np.asarray(coeff, dtype=np.float32))
+            plane_info['inliers'].append(inliers)
+            plane_info['area'].append(float(a))
+            plane_info['rot'].append(r)
+
+            print(
+                f"[filter_depth] accepted label={int(lbl)}, "
+                f"area={float(a):.1f}, n_pt={n_pt}, "
+                f"min_inlier={min_inlier}, total_kept={len(plane_info['label'])}"
+            )
+
+        # приведение к массивам
+        if plane_info['coeff']:
+            plane_info['label'] = np.asarray(plane_info['label'], dtype=np.int32)
+            plane_info['area'] = np.asarray(plane_info['area'], dtype=np.float32)
+            plane_info['coeff'] = np.asarray(plane_info['coeff'], dtype=np.float32)
+            # rot оставляем списком — filter_for_placement умеет с этим жить
+        else:
+            print("[filter_depth] no planar regions kept (even with softened RANSAC)")
+            plane_info['label'] = np.zeros((0,), dtype=np.int32)
+            plane_info['area'] = np.zeros((0,), dtype=np.float32)
+            plane_info['coeff'] = np.zeros((0, 4), dtype=np.float32)
+            plane_info['rot'] = []
 
         return plane_info
 
@@ -707,6 +931,7 @@ class TextRegions(object):
 
         # дальше используем уже существующий фильтр по форме
         return TextRegions.filter(seg_np, areas, labels)
+    
 
 
 def rescale_frontoparallel(p_fp, box_fp, p_im):
@@ -1022,6 +1247,9 @@ class RendererV3(object):
         self.persp_depth_far   = 6.0
         self.persp_invert_depth = True
 
+        self.min_text_rel_height = 0.06  # 4% от min(H,W)
+        self.min_text_aspect = 2.5
+
         if self.fast_mode:
             # 1 блок текста на картинку, минимум попыток и ужиманий
             self.max_text_regions = 1
@@ -1100,278 +1328,139 @@ class RendererV3(object):
             regions[k] = [regions[k][i] for i in idx]
         return regions
     
-    def estimate_perspective_from_depth_at_bbox(self, depth, bbox, max_alpha=0.9):
+
+    def filter_for_placement(self, xyz, seg, regions, viz=False):
         """
-        Более агрессивная оценка силы перспективы по локальному градиенту глубины.
-
-        depth: (H, W) карта глубины (float32)
-        bbox: (y0, x0, h, w) — окно, куда будет вставляться текст в IMG-координатах.
-        max_alpha: максимальная "сырая" сила перспективы (0..~1).
-
-        Возвращает alpha в [0, max_alpha]. Чем больше градиент глубины внутри bbox,
-        тем сильнее перспектива.
+        Вариант максимально близкий к оригинальному SynthText:
+        - для каждого планарного региона считаем fronto-parallel маску через get_text_placement_mask
+        - сохраняем place_mask, H, Hinv в словарь regions
         """
-        import numpy as np, cv2
 
-        if depth is None:
-            return 0.0
-
-        depth = np.asarray(depth, dtype=np.float32)
-        if depth.ndim != 2:
-            return 0.0
-
-        H, W = depth.shape[:2]
-        y0, x0, h, w = bbox
-        y1 = min(H, y0 + h)
-        x1 = min(W, x0 + w)
-        if y0 >= y1 or x0 >= x1:
-            return 0.0
-
-        patch = depth[y0:y1, x0:x1]
-        if patch.size < 16:
-            return 0.0
-
-        dzdx = cv2.Sobel(patch, cv2.CV_32F, 1, 0, ksize=3)
-        dzdy = cv2.Sobel(patch, cv2.CV_32F, 0, 1, ksize=3)
-        grad = np.sqrt(dzdx * dzdx + dzdy * dzdy)
-
-        valid = np.isfinite(grad)
-        if not np.any(valid):
-            return 0.0
-
-        # Берём чуть более "жирный" хвост, чтобы не бояться шумов
-        g_loc = float(np.percentile(grad[valid], 80))
-        g_max = float(np.percentile(grad[valid], 95))
-        if g_max <= 1e-6:
-            return 0.0
-
-        # Делаем ratio агрессивнее и чуть поджимаем сверху
-        ratio = g_loc / g_max          # 0..~1
-        ratio *= 1.8                   # усиливаем чувствительность
-        ratio = min(ratio, 1.2)        # не даём улететь слишком далеко
-
-        # Мягкая S-образная кривуля: слабые градиенты усиливаем, сильные поджимаем
-        s = max(0.0, min(1.0, ratio))  # 0..1
-        s = s ** 0.5                   # чем ближе к 1, тем сильнее
-
-        return float(max_alpha * s)
-    
-    def warp_text_with_pseudo_perspective_at_bbox(self, text_img, bb_char_fp,
-                                                  alpha, bbox_global, img_shape):
-        """
-        Делает более сильный псевдо-перспективный warp текста уже ПОСЛЕ выбора позиции.
-
-        text_img: (h, w) маска текста в локальных координатах.
-        bb_char_fp: (2, 4, N) bbox'ы символов в этих же локальных координатах.
-        alpha: "сырая" сила эффекта (0..~1) из estimate_perspective_from_depth_at_bbox.
-        bbox_global: (y0, x0, h, w) — куда этот патч встанет в изображение.
-        img_shape: (H, W) исходного изображения.
-
-        Усиления:
-        - Чем дальше текст от центра кадра, тем сильнее перспектива.
-        - Shift ограничен 70% ширины, чтобы прямоугольник не схлопнулся в линию.
-        """
-        import numpy as np, cv2
-
-        if text_img is None or alpha is None or alpha <= 1e-3:
-            return text_img, bb_char_fp
-
-        h, w = text_img.shape[:2]
-        if h < 2 or w < 2:
-            return text_img, bb_char_fp
-
-        H_img, W_img = img_shape
-        y0, x0, h_box, w_box = bbox_global
-
-        # Центр выбранного бокса и центр изображения
-        cx = x0 + w_box * 0.5
-        cy = y0 + h_box * 0.5
-        cx_img = W_img * 0.5
-        cy_img = H_img * 0.5
-
-        dx = cx - cx_img
-        dy = cy - cy_img
-
-        # Нормируем расстояние от центра в [0..~1]
-        dxn = dx / max(1.0, 0.5 * W_img)
-        dyn = dy / max(1.0, 0.5 * H_img)
-        d_norm = float(np.sqrt(dxn * dxn + dyn * dyn))
-        d_norm = float(np.clip(d_norm, 0.0, 1.2))
-
-        # Усиливаем alpha в зависимости от удаления от центра:
-        # в центре ~0.7*alpha, на краях до ~1.5*alpha
-        boost = 0.7 + 0.7 * d_norm
-        alpha_eff = float(alpha * boost)
-        alpha_eff = float(np.clip(alpha_eff, 0.0, 1.0))
-
-        # Зона / "дальняя" сторона
-        if abs(dx) >= abs(dy):
-            zone = "horizontal"
-            side_far = "left" if dx < 0 else "right"
-        else:
-            zone = "vertical"
-            side_far = "top" if dy < 0 else "bottom"
-
-        # Максимальный сдвиг — не больше 70% ширины текста
-        shift = alpha_eff * float(w)
-        shift = float(min(shift, 0.7 * float(w)))
-
-        src = np.float32([
-            [0.0,     0.0],      # TL
-            [w - 1.0, 0.0],      # TR
-            [w - 1.0, h - 1.0],  # BR
-            [0.0,     h - 1.0],  # BL
-        ])
-
-        TL, TR, BR, BL = src.copy()
-
-        if zone == "horizontal":
-            if side_far == "left":
-                TL = [shift, 0.0]
-                BL = [shift, h - 1.0]
-            else:
-                TR = [w - 1.0 - shift, 0.0]
-                BR = [w - 1.0 - shift, h - 1.0]
-        else:
-            if side_far == "top":
-                TL = [0.0,      shift]
-                TR = [w - 1.0,  shift]
-            else:
-                BL = [0.0,      h - 1.0 - shift]
-                BR = [w - 1.0,  h - 1.0 - shift]
-
-        dst = np.float32([TL, TR, BR, BL])
-
-        M = cv2.getPerspectiveTransform(src, dst)
-        warped = cv2.warpPerspective(
-            text_img, M, (w, h),
-            flags=cv2.INTER_LINEAR,
-            borderMode=cv2.BORDER_CONSTANT,
-            borderValue=0,
-        )
-
-        if bb_char_fp is not None and bb_char_fp.size:
-            pts = bb_char_fp.reshape(2, -1)
-            ones = np.ones((1, pts.shape[1]), dtype=np.float32)
-            pts_h = np.vstack([pts, ones])
-            wpts = M @ pts_h
-            wpts /= (wpts[2:3, :] + 1e-6)
-            pts2 = wpts[:2, :]
-            bb_char_fp_w = pts2.reshape(2, 4, bb_char_fp.shape[2])
-        else:
-            bb_char_fp_w = bb_char_fp
-
-        return warped, bb_char_fp_w
-
-
-
-
-    def filter_for_placement(self, xyz, seg, regions):
-        """
-        Строит place_mask / homography / homography_inv БЕЗ 3D-плоскостей
-        и оставляет только самые большие сегменты.
-
-        seg: карта сегментации (H, W), int
-        regions: словарь после TextRegions.get_regions(...):
-            'label', 'area', 'rot', ...
-        """
         import numpy as np
 
-        # аккуратно приводим seg к нормальному виду
-        seg = np.nan_to_num(np.asarray(seg), nan=0.0, posinf=0.0, neginf=0.0).astype(np.int32)
-        H_img, W_img = seg.shape[:2]
+        if regions is None or "label" not in regions or "area" not in regions:
+            print("[filter_for_placement] empty regions dict, bail out")
+            return None
 
-        labels = np.asarray(regions.get("label", []), dtype=np.int32)
-        areas  = np.asarray(regions.get("area", [])) if "area" in regions else None
-
-        I = np.eye(3, dtype=np.float32)
-
-        entries = []
-        for idx, l in enumerate(labels):
-            # маска региона по сегментации
-            seg_mask = (seg == int(l)).astype(np.uint8)
-            if seg_mask.sum() < 64:
-                continue  # совсем мелкие выкидываем
-
-            # place_mask: 0 = можно ставить текст, 255 = нельзя
-            pm = np.where(seg_mask > 0, 0, 255).astype(np.uint8)
-
-            # "полезная" площадь — сколько пикселей под текст (0)
-            free_area = int(np.count_nonzero(pm == 0))
-            if free_area <= 0:
-                continue
-
-            # если есть исходная area — используем её как основной вес,
-            # иначе берём free_area
-            if areas is not None and idx < len(areas):
-                reg_area = float(areas[idx])
-            else:
-                reg_area = float(free_area)
-
-            # сохраняем: (сортируемый_размер, свободная_площадь, label, маска)
-            entries.append((reg_area, free_area, int(l), pm))
-
-        # если ничего не набрали — фоллбек: почти весь кадр
-        if not entries:
-            margin = max(8, min(H_img, W_img) // 40)
-            pm_full = 255 * np.ones((H_img, W_img), np.uint8)
-            pm_full[margin:H_img - margin, margin:W_img - margin] = 0
-
-            regions["place_mask"]     = [pm_full]
-            regions["homography"]     = [I.copy()]
-            regions["homography_inv"] = [I.copy()]
-            regions["label"]          = np.array([1], dtype=np.int32)
-            regions["area"]           = np.array([pm_full.size], dtype=np.float32)
-            return regions
-
-        # сортируем по площади региона по убыванию
-        entries.sort(key=lambda x: x[0], reverse=True)
-
-        # сколько оставить: ориентируемся на max_text_regions
-        K = getattr(self, "max_text_regions", 4)
-        # оставим не больше 2*K самых крупных регионов
-        K = max(1, min(len(entries), K * 2))
+        n = len(regions["label"])
+        print(f"[filter_for_placement] start, n={n}")
 
         place_masks = []
-        Hs, Hinvs   = [], []
-        out_labels  = []
-        out_areas   = []
+        homographies = []
+        homographies_inv = []
+        new_labels = []
+        new_areas = []
+        new_coeffs = []
+        new_rots = []
 
-        for reg_area, free_area, l, pm in entries[:K]:
-            place_masks.append(pm)
-            Hs.append(I.copy())
-            Hinvs.append(I.copy())
-            out_labels.append(l)
-            out_areas.append(reg_area)
+        labels = np.asarray(regions["label"])
+        areas  = np.asarray(regions["area"])
 
-        regions["place_mask"]     = place_masks
-        regions["homography"]     = Hs
-        regions["homography_inv"] = Hinvs
-        regions["label"]          = np.array(out_labels, dtype=np.int32)
-        regions["area"]           = np.array(out_areas, dtype=np.float32)
+        # >>> ключевой момент: пробуем 'coeff', если нет — 'plane'
+        coeffs = regions.get("coeff", None)
+        if coeffs is None:
+            coeffs = regions.get("plane", None)
 
-        return regions
+        rots = regions.get("rot", None)
+
+        if coeffs is None:
+            print("[filter_for_placement] no plane coefficients in regions (no 'coeff' and no 'plane')")
+            return None
+
+        coeffs = np.asarray(coeffs)
+
+        for i in range(n):
+            lbl = int(labels[i])
+
+            # маска региона в исходном seg
+            mask = (seg == lbl).astype("uint8")
+
+            # коэффициенты плоскости ax + by + cz + d = 0
+            if i >= len(coeffs):
+                print(f"[filter_for_placement] region {i}, label={lbl}: coeff index out of range, skip")
+                continue
+
+            plane = coeffs[i]
+
+            res = get_text_placement_mask(xyz, mask, plane, pad=2, viz=viz)
+            if res is None:
+                print(f"[filter_for_placement] region {i}, label={lbl}: get_text_placement_mask -> None (rejected)")
+                continue
+
+            place_mask_fp, H, Hinv = res
+
+            if place_mask_fp is None or place_mask_fp.size == 0 or place_mask_fp.sum() < 50:
+                print(f"[filter_for_placement] region {i}, label={lbl}: too small rectified mask, skip")
+                continue
+
+            place_masks.append(place_mask_fp)
+            homographies.append(H)
+            homographies_inv.append(Hinv)
+            new_labels.append(lbl)
+            new_areas.append(float(areas[i]))
+            new_coeffs.append(plane)
+            if rots is not None and len(rots) > i:
+                new_rots.append(rots[i])
+            else:
+                new_rots.append(0.0)
+
+        if len(place_masks) == 0:
+            print("[filter_for_placement] all regions rejected -> None")
+            return None
+
+        out = {}
+        out["label"] = np.asarray(new_labels, dtype=labels.dtype)
+        out["area"]  = np.asarray(new_areas,  dtype=areas.dtype)
+        out["coeff"] = np.asarray(new_coeffs, dtype=np.float32)
+        out["rot"]   = np.asarray(new_rots,   dtype=np.float32)
+
+        out["place_mask"]     = place_masks           # список 2D масок FP
+        out["homography"]     = homographies          # image -> rectified
+        out["homography_inv"] = homographies_inv      # rectified -> image
+
+        print(f"[filter_for_placement] done, kept {len(place_masks)} regions")
+        return out
+
 
     
     def select_middle_regions_by_area(self, place_masks, K=6):
         """
-        Вместо «около медианы» берём K регионов
-        с максимальной площадью СВОБОДНОЙ части:
-        (mask == 0) — туда можно ставить текст.
-        Самый большой сегмент всегда будет первым.
+        Теперь выбираем ТОП-K регионов по площади исходного сегмента
+        (regions['area']), а не по площади free-area в place_mask.
+
+        K – максимальное число регионов (обычно 4).
         """
         import numpy as np
 
-        if not place_masks:
-            return []
+        # Пытаемся использовать реальные площади регионов из последнего вызова
+        regions = getattr(self, "_regions_last", None)
 
+        if regions is not None and "area" in regions:
+            areas = np.asarray(regions["area"], dtype=np.float32)
+            if areas.size == 0:
+                return []
+
+            # сортируем по убыванию площади
+            idx_sorted = np.argsort(-areas)
+            K_eff = min(int(K), len(idx_sorted))
+            top_idx = idx_sorted[:K_eff]
+
+            print(
+                "[select_regions] top-{} by region area: {}".format(
+                    K_eff,
+                    [(int(i), float(areas[i])) for i in top_idx]
+                )
+            )
+            return [int(i) for i in top_idx]
+
+        # --- Fallback: если по какой-то причине нет regions/area ---
         stats = []
         for i, pm in enumerate(place_masks):
             free_area = int(np.count_nonzero(pm == 0))  # 0 = можно
             stats.append((free_area, i))
-
         stats.sort(key=lambda x: x[0], reverse=True)
         return [i for _, i in stats[:K]]
+
 
 
     def get_dominant_text_orientation(self, img, region_mask=None):
@@ -1685,194 +1774,236 @@ class RendererV3(object):
 
 
 
-    def select_region_for_text(self, txt_str, font, f_h_px_start, f_asp,
-                               place_masks, regions, *,
-                               gap_px=6, min_font_px=14, shrink_step=0.90,
-                               side_margin=0.86, topK=4,
-                               coarse_scale=0.4, coarse_step=4, fine_step=2,
-                               min_char_px_img=8, fast_mode=False, img=None):
+    def select_region_for_text(self, txt_str, font, f_layout, f_asp,
+                           place_masks, regions, *,
+                           gap_px=6, min_font_px=14, shrink_step=0.90,
+                           side_margin=0.86, topK=4,
+                           coarse_scale=0.4, coarse_step=4, fine_step=2,
+                           min_char_px_img=8, fast_mode=False, img=None,
+                           nline=None, nchar=None):
         """
-        Выбор региона и размера шрифта + базового угла.
-        5-й аргумент — список place_masks.
+        Упрощённый выбор региона и размера шрифта.
+
+        Логика:
+        1) Строим дискретный набор размеров шрифта между min_font_px и f_layout
+        (≈5 шагов, с минимальным шагом 1 px).
+        2) Для КАЖДОГО региона (в порядке убывания площади regions['area']):
+        - смотрим на bbox свободной части (mask == 0),
+        - проверяем, влезает ли текст при каком-то размере из набора,
+        - запоминаем КРУПНЕЙШИЙ подходящий размер шрифта для этого региона.
+        3) Оставляем только регионы, где текст помещается.
+        4) Сортируем подходящие регионы по площади исходного сегмента (regions['area']) по убыванию.
+        5) Берём topK самых больших и случайно выбираем один из них.
+        6) Возвращаем (ireg, f_fit, selected_angle).
         """
         import numpy as np
+        import random
+
+        def _dbg(msg, **kw):
+            s = f"[REGION_SELECT] {msg}"
+            if kw:
+                extra = ", ".join(f"{k}={v}" for k, v in kw.items())
+                s += " | " + extra
+            print(s)
 
         if not place_masks:
+            _dbg("no place_masks -> None")
             return None, None, None
 
-        if hasattr(self, "fast_mode"):
-            fast_mode = bool(self.fast_mode)
-
-        # кандидаты по площади (около медианы)
-        cand = self.select_middle_regions_by_area(
-            place_masks,
-            K=(2 if fast_mode else topK),
-        )
-
-        if not cand:
-            return None, None, None
-
-        lo = max(int(min_font_px), 1)
-        hi = int(max(f_h_px_start, lo))
-
-        best_pair, candidate_angles, best_ireg, _ = self.find_best_region_for_text(
-            txt_str, lo, hi, f_asp, place_masks, cand, regions,
-            coarse_scale, coarse_step, fine_step, side_margin,
-            fast_mode, shrink_step, min_char_px_img, img
-        )
-        if best_pair is None:
-            return None, None, None
-
-        ireg_best, f_best = best_pair
-
-        # --- зона и финальный угол ---
-        zone_type = "horizontal"
-        dominant_orientation = 0.0
-        img_shape = None
-        text_height = 0
-        text_width = 0
-        region_coords_img = None
-
-        if img is not None and ireg_best is not None:
-            H_img, W_img = img.shape[:2]
-            img_shape = (H_img, W_img)
-
-            # центр региона в координатах изображения
-            cy_img, cx_img = self.get_region_center_img(
-                ireg_best, place_masks, regions, img_shape
-            )
-
-            # искусственный bbox вокруг центра — только для угловой логики
-            reg_h = int(0.4 * H_img)
-            reg_w = int(0.4 * W_img)
-            y_min = max(0, min(H_img - 1, cy_img - reg_h // 2))
-            x_min = max(0, min(W_img - 1, cx_img - reg_w // 2))
-            if y_min + reg_h > H_img:
-                reg_h = H_img - y_min
-            if x_min + reg_w > W_img:
-                reg_w = W_img - x_min
-            region_coords_img = (y_min, x_min, reg_h, reg_w)
-
-            zone_type = self.get_text_placement_zone(region_coords_img, img_shape)
-            text_height, text_width = self.estimate_text_size(txt_str, f_best, f_asp)
-
-            try:
-                dominant_orientation = self.get_dominant_text_orientation(img, None)
-            except Exception:
-                dominant_orientation = 0.0
-
-        if candidate_angles:
-            selected_angle = self.select_optimal_angle(
-                candidate_angles,
-                dominant_orientation,
-                zone_type,
-                region_coords_img,
-                img_shape,
-                text_height,
-                text_width,
-            )
+        # --- нормализуем nline / nchar ---
+        if nline is None or int(nline) <= 0:
+            nline_eff = 1
         else:
-            selected_angle = 0.0
+            nline_eff = int(nline)
 
-        return ireg_best, float(f_best), float(selected_angle)
+        if nchar is None or int(nchar) <= 0:
+            # по умолчанию ориентируемся на длину текста
+            nchar_eff = max(len(txt_str), 8)
+        else:
+            nchar_eff = int(nchar)
 
-    def render_text_overlay_perspective(self, img, txt_str, font,
-                                        selected_angle=None,
-                                        place_mask=None,
-                                        H=None, Hinv=None,
-                                        depth=None,
-                                        occupied_global=None,
-                                        gap_px=6):
-        """
-        Рисует текст в фронто-параллельной маске региона и
-        проецирует его в изображение через гомографию Hinv.
-        selected_angle задаёт ориентацию в плоскости региона.
-        """
-        import numpy as np, cv2
+        _dbg("layout params", nline=nline_eff, nchar=nchar_eff)
 
-        if place_mask is None or H is None or Hinv is None:
+        # --- дискретные шаги размера шрифта (шаг ≈ (f_max - f_min)/5) ---
+        f_max = float(max(f_layout, min_font_px))
+        f_min = float(min_font_px)
+
+        if f_max < f_min:
+            f_max, f_min = f_min, f_max
+
+        if f_max == f_min:
+            steps = [f_max]
+        else:
+            raw_step = (f_max - f_min) / 5.0
+            step = max(1.0, raw_step)
+
+            steps = []
+            cur = f_max
+            while cur >= f_min - 0.5:
+                steps.append(cur)
+                cur -= step
+
+            # уникальные значения, отсортированные по убыванию
+            steps = [max(f_min, s) for s in steps]
+            steps = sorted(set(steps), reverse=True)
+
+        _dbg("font steps", steps=[round(float(s), 1) for s in steps])
+
+        # --- площади регионов: сначала пробуем взять из regions['area'] ---
+        areas = None
+        if isinstance(regions, dict) and "area" in regions:
+            try:
+                areas = np.asarray(regions["area"], dtype=np.float32)
+                if areas.shape[0] != len(place_masks):
+                    _dbg("regions['area'] length mismatch, fallback to free_area",
+                        len_areas=int(areas.shape[0]), n_masks=len(place_masks))
+                    areas = None
+            except Exception as e:
+                _dbg("failed to use regions['area']", error=repr(e))
+                areas = None
+
+        if areas is None:
+            # fallback: считаем "площадь" как площадь свободной части маски
+            areas = np.zeros(len(place_masks), dtype=np.float32)
+            for i, pm in enumerate(place_masks):
+                if pm is None:
+                    continue
+                arr = np.asarray(pm)
+                if arr.ndim != 2:
+                    continue
+                free = (arr == 0)
+                areas[i] = float(free.sum())
+            _dbg("areas from free_area (fallback)")
+        else:
+            _dbg("areas from regions['area']",
+                n=int(areas.size),
+                max_area=float(areas.max()) if areas.size else 0.0)
+
+        # индексы регионов по убыванию площади исходного сегмента
+        order = np.argsort(-areas)
+
+        candidate_regions = []
+
+        for ireg in order:
+            if ireg < 0 or ireg >= len(place_masks):
+                continue
+
+            mask = place_masks[ireg]
+            if mask is None:
+                continue
+
+            arr = np.asarray(mask)
+            if arr.ndim != 2:
+                continue
+
+            # 0 = можно, 255 = нельзя
+            free = (arr == 0)
+            free_area = int(free.sum())
+            if free_area < (min_font_px * min_font_px * 1.5):
+                # слишком маленький "рабочий" регион, пропускаем
+                continue
+
+            ys, xs = np.where(free)
+            if xs.size == 0 or ys.size == 0:
+                continue
+
+            x0 = int(xs.min())
+            x1 = int(xs.max())
+            y0 = int(ys.min())
+            y1 = int(ys.max())
+            W_reg = x1 - x0 + 1
+            H_reg = y1 - y0 + 1
+
+            # минимальные размеры региона относительно пикселей текста
+            if W_reg < min_char_px_img * 2 or H_reg < min_char_px_img * 1.5:
+                continue
+
+            best_f_for_region = None
+
+            for f in steps:
+                char_h = float(f)
+                char_w = float(f) * float(f_asp)
+
+                # грубая оценка размеров блока текста
+                total_h = nline_eff * char_h * 1.3 + 2 * gap_px
+                total_w = nchar_eff * char_w * 1.1 + 2 * gap_px
+
+                if total_h < min_char_px_img or total_w < min_char_px_img:
+                    continue
+
+                if (total_w <= W_reg * side_margin and
+                        total_h <= H_reg * side_margin):
+                    # нашли КРУПНЕЙШИЙ подходящий размер для этого региона
+                    best_f_for_region = float(f)
+                    break
+
+            if best_f_for_region is None:
+                # в этот регион текст не влез при разумных размерах
+                continue
+
+            candidate_regions.append(
+                dict(
+                    ireg=int(ireg),
+                    region_area=float(areas[ireg]),
+                    free_area=free_area,
+                    f_fit=best_f_for_region,
+                    bbox=(x0, y0, x1, y1),
+                )
+            )
+
+        if not candidate_regions:
+            _dbg("no suitable regions after font/mask checks")
             return None, None, None
 
+        # --- сортируем по площади исходного региона (после filter_depth/небо) ---
+        candidate_regions.sort(key=lambda r: r["region_area"], reverse=True)
+
+        if topK is None:
+            topK = 4
+        topK_eff = max(1, min(int(topK), len(candidate_regions)))
+        top_regions = candidate_regions[:topK_eff]
+
+        chosen = random.choice(top_regions)
+        ireg_chosen = chosen["ireg"]
+        f_fit = chosen["f_fit"]
+
+        # === НОВОЕ: вычисляем угол региона и добавляем небольшой джиттер ===
         try:
-            txt_arr, txt_str_norm, bb_char_xywh = self.text_renderer.render_curved(
-                font, txt_str,
-                char_gap_px=getattr(self, "char_gap_px", 0),
-                word_gap_px=getattr(self, "word_gap_px", 1),
-            )
+            base_angle = self.estimate_region_axis_angle(place_masks[ireg_chosen])
         except Exception:
-            return None, None, None
+            base_angle = 0.0
 
-        if txt_arr is None or txt_arr.size == 0:
-            return None, None, None
+        # случайное смещение вокруг оси региона, чтобы не было идеально ровно
+        jitter = random.uniform(-10.0, 10.0)
+        angle_raw = base_angle + jitter
 
-        bb_char_fp = self.text_renderer.bb_xywh2coords(bb_char_xywh)
+        # нормализуем к "читаемому" диапазону [-90, 90], чтобы текст не был вверх ногами
+        angle_norm = (angle_raw + 180.0) % 360.0 - 180.0
+        if angle_norm > 90.0:
+            angle_norm -= 180.0
+        elif angle_norm < -90.0:
+            angle_norm += 180.0
 
-        pad_t, pad_b, pad_l, pad_r = 1, max(2, int(0.18 * font.size)), 1, 1
-        txt_arr = cv2.copyMakeBorder(
-            txt_arr, pad_t, pad_b, pad_l, pad_r,
-            borderType=cv2.BORDER_CONSTANT, value=0,
-        )
-        bb_char_fp[0, :, :] += pad_l
-        bb_char_fp[1, :, :] += pad_t
+        selected_angle = float(angle_norm)
 
-        if selected_angle is not None and abs(selected_angle) > 1e-3:
-            txt_arr, bb_char_fp = self.rotate_text_and_bbox(
-                txt_arr, bb_char_fp, selected_angle
-            )
-
-        h_txt, w_txt = txt_arr.shape[:2]
-        H_fp, W_fp = place_mask.shape[:2]
-
-        # строим "запрещённую" маску с учётом занятости и глубины
-        try:
-            forbid_fp = build_forbidden_mask_rectified(
-                place_mask, H, occupied_global, depth, gap=gap_px
-            )
-        except Exception:
-            forbid_fp = place_mask.copy()
-
-        free255 = (forbid_fp == 0).astype(np.uint8) * 255
-
-        ok, top_left = any_fit_with_integral(free255, h_txt, w_txt, step=2)
-        if (not ok) or (top_left is None):
-            return None, None, None
-
-        y0_fp, x0_fp = top_left
-        text_mask_fp = np.zeros_like(place_mask, dtype=np.uint8)
-
-        mask_local = (txt_arr > 0).astype(np.uint8) * 255
-        h_clip = min(h_txt, max(0, H_fp - y0_fp))
-        w_clip = min(w_txt, max(0, W_fp - x0_fp))
-        if h_clip <= 0 or w_clip <= 0:
-            return None, None, None
-
-        text_mask_fp[y0_fp:y0_fp + h_clip, x0_fp:x0_fp + w_clip] = \
-            mask_local[:h_clip, :w_clip]
-
-        bb_char_fp[0, :, :] += x0_fp
-        bb_char_fp[1, :, :] += y0_fp
-
-        H_img, W_img = img.shape[:2]
-        warped_mask = cv2.warpPerspective(
-            text_mask_fp, Hinv, (W_img, H_img),
-            flags=cv2.WARP_INVERSE_MAP | cv2.INTER_NEAREST,
+        _dbg(
+            "chosen region",
+            ireg=ireg_chosen,
+            f_fit=round(float(f_fit), 2),
+            region_area=round(float(chosen["region_area"]), 1),
+            free_area=int(chosen["free_area"]),
+            topK_len=len(top_regions),
+            base_angle=round(float(base_angle), 1),
+            selected_angle=round(selected_angle, 1),
         )
 
-        N = bb_char_fp.shape[2]
-        pts_fp  = bb_char_fp.reshape(2, 4 * N).T.astype(np.float32)  # (4N,2)
-        pts_img = _warp_points(Hinv, pts_fp)
-        bb_img  = pts_img.T.reshape(2, 4, N)
-
-        min_h = self.get_min_h(bb_img, txt_str_norm)
-        img_colored = self.colorizer.color(
-            img.copy(), [warped_mask], np.array([min_h])
-        )
-
-        return img_colored, bb_img, warped_mask
+        return int(ireg_chosen), float(f_fit), selected_angle
 
 
 
 
+
+    
     def estimate_region_axis_angle(self, region_mask):
         """
         Оценивает доминирующее направление длинной стороны свободной области региона.
@@ -2110,146 +2241,6 @@ class RendererV3(object):
         )
         return rotated_mask
     
-    def warp_text_with_pseudo_perspective(self, text_img, bb_char_fp,
-                                          alpha, region_coords, img_shape):
-        """
-        Делает лёгкий перспективный варп текста:
-        - alpha в [0..~0.35] задаёт "силу" перспективы (чем больше, тем сильнее трапеция),
-        - направление берётся из положения region_coords относительно центра изображения.
-
-        Мы НЕ используем никакие H/Hinv, только warpPerspective по трапеции.
-        """
-        import numpy as np, cv2
-
-        if text_img is None or alpha is None or alpha <= 1e-3:
-            return text_img, bb_char_fp
-
-        h, w = text_img.shape[:2]
-        if h < 2 or w < 2:
-            return text_img, bb_char_fp
-
-        H_img, W_img = img_shape
-        y_min, x_min, reg_h, reg_w = region_coords
-        # центр региона
-        cy = y_min + reg_h * 0.5
-        cx = x_min + reg_w * 0.5
-        # центр изображения
-        cy_img = H_img * 0.5
-        cx_img = W_img * 0.5
-
-        # горизонтальная / вертикальная зона
-        zone_type = self.get_text_placement_zone(region_coords, (H_img, W_img))
-
-        # от какой стороны "сжимать"
-        side_horiz = "right" if cx >= cx_img else "left"
-        side_vert  = "bottom" if cy >= cy_img else "top"
-
-        # Насколько сильно можно сжать сторону
-        shift = float(alpha) * w  # max ~ 35% ширины
-
-        # исходный прямоугольник текста
-        src = np.float32([
-            [0.0, 0.0],     # TL
-            [w - 1.0, 0.0], # TR
-            [w - 1.0, h-1.0],# BR
-            [0.0, h-1.0],   # BL
-        ])
-
-        # целевые точки (трапеция)
-        TL, TR, BR, BL = src.copy()
-
-        if zone_type == "horizontal":
-            if side_horiz == "left":
-                # регион слева → левая сторона дальше → сжимаем левую грань
-                TL = [shift, 0.0]
-                BL = [shift, h - 1.0]
-            else:
-                # регион справа → правая сторона дальше → сжимаем правую грань
-                TR = [w - 1.0 - shift, 0.0]
-                BR = [w - 1.0 - shift, h - 1.0]
-        else:
-            # вертикальная зона
-            if side_vert == "top":
-                # сверху → верхняя сторона дальше
-                TL = [0.0, shift]
-                TR = [w - 1.0, shift]
-            else:
-                # снизу → нижняя сторона дальше
-                BL = [0.0, h - 1.0 - shift]
-                BR = [w - 1.0, h - 1.0 - shift]
-
-        dst = np.float32([TL, TR, BR, BL])
-
-        # матрица перспективного преобразования
-        M = cv2.getPerspectiveTransform(src, dst)
-
-        # варп текста
-        warped = cv2.warpPerspective(
-            text_img, M, (w, h),
-            flags=cv2.INTER_LINEAR,
-            borderMode=cv2.BORDER_CONSTANT,
-            borderValue=0,
-        )
-
-        # варп bbox (2 x 4 x N)
-        if bb_char_fp is not None and bb_char_fp.size:
-            pts = bb_char_fp.reshape(2, -1)          # (2, 4*N)
-            ones = np.ones((1, pts.shape[1]), dtype=np.float32)
-            pts_h = np.vstack([pts, ones])           # (3, 4*N)
-            wpts = M @ pts_h                         # (3, 4*N)
-            wpts /= (wpts[2:3, :] + 1e-6)
-            pts2 = wpts[:2, :]
-            bb_char_fp_warped = pts2.reshape(2, 4, bb_char_fp.shape[2])
-        else:
-            bb_char_fp_warped = bb_char_fp
-
-        return warped, bb_char_fp_warped
-
-    
-    def estimate_perspective_strength_from_depth(self, depth, region_mask, max_alpha=0.35):
-        """
-        depth: 2D карта глубины (H x W, float)
-        region_mask: маска региона (H x W), >0 внутри региона
-
-        Возвращает alpha в [0, max_alpha], которая говорит,
-        насколько сильно искажать текст под "перспективу".
-        Чем больше локальный градиент глубины — тем больше alpha.
-        """
-        import numpy as np, cv2
-
-        if depth is None or region_mask is None:
-            return 0.0
-
-        depth = np.asarray(depth, dtype=np.float32)
-        if depth.shape[:2] != region_mask.shape[:2]:
-            return 0.0
-
-        # Градиент по всей карте глубины
-        dzdx = cv2.Sobel(depth, cv2.CV_32F, 1, 0, ksize=3)
-        dzdy = cv2.Sobel(depth, cv2.CV_32F, 0, 1, ksize=3)
-        grad_mag = np.sqrt(dzdx * dzdx + dzdy * dzdy)
-
-        valid = np.isfinite(grad_mag)
-        if not np.any(valid):
-            return 0.0
-
-        # Значения градиента внутри региона
-        mask = (region_mask > 0) & valid
-        vals = grad_mag[mask]
-        if vals.size < 32:
-            return 0.0
-
-        # Локальная "типичная" величина наклона
-        g_loc = np.percentile(vals, 75)
-
-        # Глобальный "верхний" уровень наклона, чтобы нормировать
-        g_all = np.percentile(grad_mag[valid], 95)
-        if g_all <= 1e-6:
-            return 0.0
-
-        strength = float(np.clip(g_loc / g_all, 0.0, 1.0))
-        return strength * float(max_alpha)
-
     
     def place_text_textfirst(self, img, place_masks, regions, gap=6,
                              min_font_px=14, start_font_px=None, start_font_px_range=None,
@@ -2260,148 +2251,339 @@ class RendererV3(object):
         """
         import numpy as np
 
+        # --- helper для логов ---
+        def _dbg(msg, **kw):
+            s = f"[TXT] place_text_textfirst: {msg}"
+            if kw:
+                extra = ", ".join(f"{k}={v}" for k, v in kw.items())
+                s += " | " + extra
+            print(s)
+
         H_img, W_img = img.shape[:2]
+        n_masks = len(place_masks) if place_masks is not None else 0
+
+        _dbg(
+            "start",
+            img_shape=img.shape,
+            n_place_masks=n_masks,
+            gap=gap,
+            min_font_px=min_font_px,
+            start_font_px=start_font_px,
+            start_font_px_range=start_font_px_range,
+            shrink_step=shrink_step
+        )
 
         if not place_masks:
+            _dbg("return None: no place_masks (empty or None)")
             return None
 
         if 'segmentation' not in regions:
             regions['segmentation'] = place_masks
+            _dbg("regions['segmentation'] not found, set from place_masks")
 
         # --- шрифт ---
-        fs = self.text_renderer.font_state.sample()
-        font = self.text_renderer.font_state.init_font(fs)
-        f_asp = self.text_renderer.font_state.get_aspect_ratio(font)
+        try:
+            fs = self.text_renderer.font_state.sample()
+            font = self.text_renderer.font_state.init_font(fs)
+            f_asp = self.text_renderer.font_state.get_aspect_ratio(font)
+        except Exception as e:
+            _dbg("return None: font init failed", error=repr(e))
+            return None
 
         short_side = float(min(H_img, W_img))
         base_char = max(min_font_px, short_side / 14.0)
 
-        if start_font_px_range is not None:
-            lo_rng, hi_rng = start_font_px_range
-            if lo_rng > hi_rng:
-                lo_rng, hi_rng = hi_rng, lo_rng
-            f_start = int(np.random.randint(int(lo_rng), int(hi_rng) + 1))
-            f_start = max(f_start, int(min_font_px))
-        elif start_font_px is not None:
-            f_start = max(float(start_font_px), float(min_font_px))
-        else:
-            last = getattr(self, "last_font_h_px", None)
-            if last is not None:
-                f_start = max(float(last), base_char)
+        # выбор стартового размера шрифта
+        try:
+            if start_font_px_range is not None:
+                lo_rng, hi_rng = start_font_px_range
+                if lo_rng > hi_rng:
+                    lo_rng, hi_rng = hi_rng, lo_rng
+                f_start = int(np.random.randint(int(lo_rng), int(hi_rng) + 1))
+                f_start = max(f_start, int(min_font_px))
+                src = "range"
+            elif start_font_px is not None:
+                f_start = max(float(start_font_px), float(min_font_px))
+                src = "explicit"
             else:
-                f_start = base_char
+                last = getattr(self, "last_font_h_px", None)
+                if last is not None:
+                    f_start = max(float(last), base_char)
+                    src = "last_font_h_px"
+                else:
+                    f_start = base_char
+                    src = "base_char"
 
-        jitter = np.random.uniform(0.9, 1.1)
-        f_start *= jitter
-        f_start = float(np.clip(f_start, min_font_px, short_side / 16.0))
+            jitter = np.random.uniform(0.9, 1.1)
+            f_start_before_clip = f_start * jitter
+            f_start = float(np.clip(f_start_before_clip, min_font_px, short_side / 16.0))
 
-        f_layout = int(round(f_start * 1.30))
-        if f_layout < min_font_px:
-            f_layout = int(min_font_px)
+            f_layout = int(round(f_start * 1.30))
+            if f_layout < min_font_px:
+                f_layout = int(min_font_px)
 
-        # --- оценка (nline, nchar) от get_nline_nchar + форс минимального nchar ---
+            _dbg(
+                "font sizing",
+                source=src,
+                base_char=round(base_char, 2),
+                f_start_raw=round(f_start_before_clip, 2),
+                f_start_clipped=round(f_start, 2),
+                f_layout=f_layout,
+                f_asp=round(float(f_asp), 3)
+            )
+        except Exception as e:
+            _dbg("return None: font sizing failed", error=repr(e))
+            return None
+
+        # --- оценка (nline, nchar) --- 
         try:
             nline_raw, nchar_raw = self.text_renderer.get_nline_nchar(
                 (128, 512),
                 f_layout,
                 f_layout * f_asp
             )
-        except Exception:
+            _dbg(
+                "get_nline_nchar",
+                nline_raw=nline_raw,
+                nchar_raw=nchar_raw
+            )
+        except Exception as e:
+            _dbg("get_nline_nchar failed, fallback to (1, 12)", error=repr(e))
             nline_raw, nchar_raw = 1, 12
 
         # форсим разумные значения
         nline_eff = max(1, int(nline_raw or 1))
-
         if nchar_raw is None or int(nchar_raw) < 6:
             nchar_eff = 10
         else:
             nchar_eff = int(nchar_raw)
 
+        _dbg(
+            "layout target",
+            nline_eff=nline_eff,
+            nchar_eff=nchar_eff
+        )
+
         # --- надёжный выбор текста ---
-        txt_str = self._sample_layout_text(nline_eff, nchar_eff, max_retries=5)
+        try:
+            txt_str = self._sample_layout_text(nline_eff, nchar_eff, max_retries=5)
+        except Exception as e:
+            _dbg("return None: _sample_layout_text raised", error=repr(e))
+            return None
 
         if not txt_str or not isinstance(txt_str, str) or not txt_str.strip():
+            _dbg("return None: txt_str empty or not str",
+                 txt_type=str(type(txt_str)))
             return None
 
         txt_str = txt_str.strip()
+        _dbg("txt_str chosen",
+             txt_preview=(txt_str[:50] + "..." if len(txt_str) > 50 else txt_str),
+             len=len(txt_str))
+
+        # --- кэш регионов для get_region_coordinates ---
+        self._regions_last = regions
+        try:
+            self._region_id_to_index = {id(pm): idx for idx, pm in enumerate(place_masks)}
+        except Exception:
+            self._region_id_to_index = {}
 
         # --- выбираем регион и итоговый размер ---
-        ireg, f_fit, selected_angle = self.select_region_for_text(
-            txt_str, font, f_layout, f_asp, place_masks, regions,
-            gap_px=gap,
-            min_font_px=min_font_px,
-            shrink_step=shrink_step,
-            side_margin=0.92,
-            topK=(2 if getattr(self, "fast_mode", False) else 4),
-            coarse_scale=(0.33 if getattr(self, "fast_mode", False) else 0.4),
-            coarse_step=(8 if getattr(self, "fast_mode", False) else 4),
-            fine_step=(3 if getattr(self, "fast_mode", False) else 2),
-            min_char_px_img=getattr(self, "min_char_px_img", 8),
-            fast_mode=getattr(self, "fast_mode", False),
-            img=img
-        )
-        if ireg is None:
+        try:
+            ireg, f_fit, selected_angle = self.select_region_for_text(
+                txt_str, font, f_layout, f_asp, place_masks, regions,
+                gap_px=gap,
+                min_font_px=min_font_px,
+                shrink_step=shrink_step,
+                side_margin=0.92,
+                topK=(2 if getattr(self, "fast_mode", False) else 4),
+                coarse_scale=(0.33 if getattr(self, "fast_mode", False) else 0.4),
+                coarse_step=(8 if getattr(self, "fast_mode", False) else 4),
+                fine_step=(3 if getattr(self, "fast_mode", False) else 2),
+                min_char_px_img=getattr(self, "min_char_px_img", 8),
+                fast_mode=getattr(self, "fast_mode", False),
+                img=img,
+                nline=nline_eff,
+                nchar=nchar_eff,
+            )
+        except Exception as e:
+            _dbg("return None: select_region_for_text raised", error=repr(e))
             return None
+
+        if ireg is None:
+            _dbg("return None: select_region_for_text returned ireg=None")
+            return None
+
+        _dbg(
+            "region selected",
+            ireg=int(ireg),
+            f_fit=round(float(f_fit), 2),
+            angle=round(float(selected_angle), 2)
+        )
 
         key = (int(ireg), int(round(f_fit)))
         if hasattr(self, "_failed_pairs") and (key in self._failed_pairs):
+            _dbg("return None: (ireg, f_fit) in _failed_pairs",
+                 ireg=int(ireg),
+                 f_fit=int(round(f_fit)))
             return None
 
         # --- проверка локального масштаба ---
         try:
             Hinv_reg = regions['homography_inv'][ireg]
-            free_mask_fp = (place_masks[ireg] == 0).astype(np.uint8)
+            region_mask = place_masks[ireg]
+            free_mask_fp = (region_mask == 0).astype(np.uint8)
+
             s_loc = estimate_local_scale_grid(Hinv_reg, free_mask_fp, k=9, delta=6)
+            _dbg(
+                "local scale",
+                s_loc=round(float(s_loc), 3),
+                min_char_px_img=getattr(self, "min_char_px_img", 8),
+                s_loc_times_f_fit=round(float(s_loc * f_fit), 2)
+            )
+
             if s_loc * f_fit < getattr(self, "min_char_px_img", 8):
+                _dbg("return None: s_loc * f_fit too small",
+                     s_loc_times_f_fit=round(float(s_loc * f_fit), 2))
                 return None
-        except Exception:
-            pass
+        except Exception as e:
+            _dbg("local scale check failed (ignored)", error=repr(e))
 
-        font.size = self.text_renderer.font_state.get_font_size(font, f_fit)
-
-        region_mask = place_masks[ireg]
-        region_coords = self.get_region_coordinates(region_mask)
-        if region_coords is None:
+        # --- финальный размер шрифта ---
+        try:
+            font.size = self.text_renderer.font_state.get_font_size(font, f_fit)
+            _dbg("font.size set", f_fit=round(float(f_fit), 2), font_size=font.size)
+        except Exception as e:
+            _dbg("return None: get_font_size failed", error=repr(e))
             return None
 
-        img_new, bb_img, text_mask_img = self.render_text_overlay(
-            img, txt_str, font,
-            selected_angle=selected_angle,
-            region_coords=region_coords,
-            depth=depth
+        # --- координаты региона ---
+        region_mask = place_masks[ireg]
+        try:
+            region_coords = self.get_region_coordinates(region_mask)
+        except Exception as e:
+            _dbg("return None: get_region_coordinates raised", error=repr(e))
+            return None
+
+        if region_coords is None:
+            _dbg("return None: get_region_coordinates returned None")
+            return None
+
+        _dbg(
+            "region_coords ok",
+            n_points=(len(region_coords) if hasattr(region_coords, "__len__") else "?"
+                      )
         )
 
-        if img_new is None:
+        # --- рендер текста в регион ---
+        try:
+            img_new, bb_img, text_mask_img = self.render_text_overlay(
+                img, txt_str, font,
+                selected_angle=selected_angle,
+                region_coords=region_coords,
+                depth=depth
+            )
+        except Exception as e:
+            _dbg("return None: render_text_overlay raised", error=repr(e))
             return None
 
+        if img_new is None:
+            _dbg("return None: img_new is None after render_text_overlay")
+            return None
+
+        if text_mask_img is None:
+            _dbg("return None: text_mask_img is None after render_text_overlay")
+            return None
+
+        # немного статистики по маске, чтобы видеть, что реально нарисовали
+        try:
+            mask_area = int((text_mask_img > 0).sum())
+            _dbg(
+                "render result",
+                mask_area=mask_area,
+                bbox_is_none=(bb_img is None),
+                H_img=H_img,
+                W_img=W_img
+            )
+            if mask_area == 0:
+                _dbg("return None: text_mask_img empty (area=0)")
+                return None
+        except Exception as e:
+            _dbg("mask stats failed (ignored)", error=repr(e))
+
+        # запоминаем последний удачный размер
         self.last_font_h_px = f_fit
+        _dbg("SUCCESS", txt_len=len(txt_str), ireg=int(ireg))
 
         return img_new, txt_str, bb_img, text_mask_img
 
 
-
     def get_region_coordinates(self, region_mask):
         """
-        Получает координаты bounding box для свободного пространства в регионе.
-        Возвращает (y_min, x_min, height, width) или None если регион пустой.
+        Возвращает координаты региона в КООРДИНАТАХ ИЗОБРАЖЕНИЯ
+        в виде 4 углов [[x0,y0],[x1,y0],[x1,y1],[x0,y1]].
+
+        ВАЖНО:
+        - place_mask: 0 = можно, 255 = нельзя → берём bbox только по "нулям".
+        - сами маски хранятся во фронто-параллельных координатах, поэтому
+          при наличии homography_inv проецируем bbox в image-space.
         """
-        # Находим координаты свободного пространства (где маска == 0)
-        free_space_coords = np.column_stack(np.where(region_mask == 0))
-        
-        if len(free_space_coords) == 0:
+        import numpy as np
+
+        # 1) bbox по "разрешённой" области (0 = можно)
+        ys, xs = np.where(region_mask == 0)
+        if xs.size == 0:
+            print("[REGION] empty free area in region_mask -> None")
             return None
-        
-        # Находим границы свободного пространства
-        y_coords = free_space_coords[:, 0]
-        x_coords = free_space_coords[:, 1]
-        
-        y_min, y_max = y_coords.min(), y_coords.max()
-        x_min, x_max = x_coords.min(), x_coords.max()
-        
-        height = y_max - y_min + 1
-        width = x_max - x_min + 1
-        
-        return (y_min, x_min, height, width)
+
+        x0_fp, x1_fp = xs.min(), xs.max()
+        y0_fp, y1_fp = ys.min(), ys.max()
+
+        corners_fp = np.array([
+            [x0_fp, y0_fp],
+            [x1_fp, y0_fp],
+            [x1_fp, y1_fp],
+            [x0_fp, y1_fp],
+        ], dtype=np.float32)
+
+        # 2) пробуем спроецировать в координаты исходного изображения
+        Hinv = None
+        ireg = None
+        regions = getattr(self, "_regions_last", None)
+        id2idx = getattr(self, "_region_id_to_index", None)
+
+        if regions is not None and id2idx is not None:
+            ireg = id2idx.get(id(region_mask), None)
+            try:
+                if ireg is not None and "homography_inv" in regions:
+                    Hinvs = regions["homography_inv"]
+                    if ireg < len(Hinvs):
+                        Hinv = Hinvs[ireg]
+            except Exception as e:
+                print("[REGION] failed to fetch Hinv for region:", repr(e))
+                Hinv = None
+
+        if Hinv is not None:
+            try:
+                # _warp_points: (Hinv, pts_xy[N,2]) -> (N,2) в image-space
+                corners_img = _warp_points(Hinv, corners_fp)
+                coords = corners_img.astype(np.float32)
+                print(
+                    f"[REGION] ireg={ireg}, "
+                    f"bbox_fp=({x0_fp},{y0_fp})-({x1_fp},{y1_fp}), "
+                    f"corners_img={coords.tolist()}"
+                )
+                return coords
+            except Exception as e:
+                print("[REGION] _warp_points failed, fallback to FP coords:", repr(e))
+
+        # fallback: отдаём bbox в координатах маски (FP)
+        print(
+            f"[REGION] no Hinv, using FP bbox: "
+            f"({x0_fp},{y0_fp})-({x1_fp},{y1_fp})"
+        )
+        return corners_fp
+
     
     def get_region_center_img(self, ireg, place_masks, regions, img_shape):
         """
@@ -2626,12 +2808,17 @@ class RendererV3(object):
 
     def _sample_layout_text(self, nline, nchar, max_retries=5):
         """
-        Надёжный выбор текста под заданные (nline, nchar):
+        Надёжный выбор ТОЛЬКО ОДНОГО СЛОВА под заданные (nline, nchar).
+
+        Логика:
         - несколько попыток text_source.sample(...)
-        - нормализация списка -> строки
-        - проверка на непустоту
-        - fallback-текст, если всё совсем плохо
+        - приводим результат к строке
+        - из строки выбираем одно слово длиной >= self.min_word_len
+        - если всё плохо — отдаём fallback-слово.
         """
+        import random
+
+        min_len = int(getattr(self, "min_word_len", 4))
         txt_str = None
         raw_obj = None
 
@@ -2655,224 +2842,434 @@ class RendererV3(object):
             else:
                 txt_str = None
 
-            if txt_str:
-                return txt_str
+            if not txt_str:
+                continue
+
+            # Разбиваем на слова и выбираем одно подходящее
+            words = [w for w in txt_str.split() if len(w) >= min_len]
+            if not words:
+                continue
+
+            # Одно слово на блок
+            return random.choice(words)
 
         # --- Fallback — чтобы генерация вообще не умирала ---
-        fallback = "пример текста для генерации"
+        fallback = "пример"
         return fallback
 
 
-
-
-    def render_text_overlay(self, img, txt_str, font,
-                            selected_angle=None,
-                            region_coords=None,
-                            depth=None):
+    def render_text_overlay(self, img, txt_str, font, selected_angle, region_coords, depth=None):
         """
-        Рисует текст внутри region_coords:
-          1) рендер текста в локальный патч,
-          2) поворот текста,
-          3) выбор (y0, x0) внутри region_coords с ЗАПРЕТОМ сектора 30–150°,
-          4) по depth[y0:y1, x0:x1] считаем силу перспективы (если depth есть),
-          5) псевдо-перспективный warp патча,
-          6) вклейка в img,
-          7) усиление яркости текста + тёмная обводка.
+        Рисует txt_str внутри региона.
+
+        - region_coords может быть:
+            * массив точек (N, 2) в координатах изображения;
+            * 4 числа: (x0, y0, x1, y1) / (y0, x0, y1, x1) / (x, y, w, h).
+
+        Возвращает:
+            img_new       — изображение с текстом,
+            charBB        — (2, 4, N_chars) в глобальных координатах,
+            text_mask_img — маска текста в глобальных координатах.
         """
-        import numpy as np, cv2
+        import numpy as np
+        import cv2
+        import pygame
+        import random
 
-        H, W = img.shape[:2]
-
-        # 1) рендер текста в фронтопараллельном виде
         try:
-            txt_arr, txt_str_norm, bb_char_xywh = self.text_renderer.render_curved(
-                font, txt_str,
-                char_gap_px=getattr(self, "char_gap_px", 0),
-                word_gap_px=getattr(self, "word_gap_px", 1),
+            H, W = img.shape[:2]
+            print(
+                f"[OVERLAY] start | txt='{txt_str[:32]}' len={len(txt_str)}, "
+                f"type(region_coords)={type(region_coords)}, "
+                f"has_shape={hasattr(region_coords, 'shape')}, "
+                f"selected_angle={selected_angle}"
             )
-        except Exception:
-            return None, None, None
 
-        if txt_arr is None or txt_arr.size == 0:
-            return None, None, None
+            # -------- 1. Нормализуем region_coords в bbox (x0, y0, x1, y1) --------
+            x0 = y0 = x1 = y1 = None
 
-        bb_char_fp = self.text_renderer.bb_xywh2coords(bb_char_xywh)
+            rc = np.asarray(region_coords)
+            if rc.ndim == 2 and rc.shape[1] == 2:
+                # Интерпретируем как полигон
+                print(f"[OVERLAY] region_coords as polygon, shape={rc.shape}")
+                xs = rc[:, 0]
+                ys = rc[:, 1]
+                x0 = float(xs.min())
+                x1 = float(xs.max())
+                y0 = float(ys.min())
+                y1 = float(ys.max())
+            else:
+                # Плоский формат: 4 числа
+                flat = np.asarray(region_coords, dtype=np.float32).ravel()
+                print(f"[OVERLAY] region_coords flat={flat}, shape={flat.shape}")
 
-        # 2) паддинги вокруг текста
-        pad_t = 1
-        pad_b = max(2, int(0.18 * font.size))
-        pad_l, pad_r = 1, 1
-        txt_arr = cv2.copyMakeBorder(
-            txt_arr, pad_t, pad_b, pad_l, pad_r,
-            borderType=cv2.BORDER_CONSTANT, value=0,
-        )
-        bb_char_fp[0, :, :] += pad_l
-        bb_char_fp[1, :, :] += pad_t
+                if flat.size != 4:
+                    print("[OVERLAY] unsupported region_coords format, size != 4")
+                    return None, None, None
 
-        h_fp, w_fp = txt_arr.shape[:2]
+                a, b, c, d = flat.tolist()
+                candidates = []
 
-        # 3) поворот всего патча с bbox
-        if selected_angle is not None and abs(selected_angle) > 1e-3:
-            txt_arr, bb_char_fp = self.rotate_text_and_bbox(
-                txt_arr, bb_char_fp, selected_angle
-            )
-            h_fp, w_fp = txt_arr.shape[:2]
+                def _check_xyxy(x0_, y0_, x1_, y1_):
+                    vals = np.array([x0_, y0_, x1_, y1_], dtype=np.float32)
+                    if not np.isfinite(vals).all():
+                        return None
+                    if x1_ <= x0_ + 5 or y1_ <= y0_ + 5:
+                        return None
+                    if x0_ < -5 or y0_ < -5 or x1_ > W + 5 or y1_ > H + 5:
+                        return None
+                    return (x0_, y0_, x1_, y1_)
 
-        # 4) если патч > изображения — чуть ужмём
-        if h_fp >= H or w_fp >= W:
-            scale = min(
-                (H - 2) / max(h_fp, 1),
-                (W - 2) / max(w_fp, 1),
-                0.85
-            )
-            if not (np.isfinite(scale) and scale > 0):
+                def _check_yx_yx(y0_, x0_, y1_, x1_):
+                    vals = np.array([x0_, y0_, x1_, y1_], dtype=np.float32)
+                    if not np.isfinite(vals).all():
+                        return None
+                    if x1_ <= x0_ + 5 or y1_ <= y0_ + 5:
+                        return None
+                    if x0_ < -5 or y0_ < -5 or x1_ > W + 5 or y1_ > H + 5:
+                        return None
+                    return (x0_, y0_, x1_, y1_)
+
+                def _check_xywh(x_, y_, w_, h_):
+                    vals = np.array([x_, y_, w_, h_], dtype=np.float32)
+                    if not np.isfinite(vals).all():
+                        return None
+                    if w_ <= 5 or h_ <= 5:
+                        return None
+                    x0_ = x_
+                    y0_ = y_
+                    x1_ = x_ + w_
+                    y1_ = y_ + h_
+                    if x0_ < -5 or y0_ < -5 or x1_ > W + 5 or y1_ > H + 5:
+                        return None
+                    return (x0_, y0_, x1_, y1_)
+
+                cand1 = _check_xyxy(a, b, c, d)
+                if cand1 is not None:
+                    candidates.append(("xyxy", cand1))
+
+                cand2 = _check_yx_yx(a, b, c, d)
+                if cand2 is not None:
+                    candidates.append(("yx_yx", cand2))
+
+                cand3 = _check_xywh(a, b, c, d)
+                if cand3 is not None:
+                    candidates.append(("xywh", cand3))
+
+                if not candidates:
+                    print("[OVERLAY] no valid bbox interpretation for flat coords")
+                    return None, None, None
+
+                # выбираем bbox с МИНИМАЛЬНОЙ площадью
+                best_type, (x0, y0, x1, y1) = min(
+                    candidates,
+                    key=lambda kv: (kv[1][2] - kv[1][0]) * (kv[1][3] - kv[1][1])
+                )
+                print(
+                    f"[OVERLAY] interpreted flat as {best_type}: "
+                    f"x0={x0:.1f}, y0={y0:.1f}, x1={x1:.1f}, y1={y1:.1f}"
+                )
+
+            # -------- 2. Проверка bbox и небольшая "усадка" внутрь --------
+            if x0 is None or y0 is None or x1 is None or y1 is None:
+                print("[OVERLAY] bbox not resolved")
                 return None, None, None
 
-            new_w = max(1, int(round(w_fp * scale)))
-            new_h = max(1, int(round(h_fp * scale)))
-            txt_arr = cv2.resize(txt_arr, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+            x0 = max(0.0, min(float(x0), W - 1.0))
+            x1 = max(0.0, min(float(x1), W - 1.0))
+            y0 = max(0.0, min(float(y0), H - 1.0))
+            y1 = max(0.0, min(float(y1), H - 1.0))
 
-            sx = new_w / max(w_fp, 1e-6)
-            sy = new_h / max(h_fp, 1e-6)
-            bb_char_fp[0, :, :] *= sx
-            bb_char_fp[1, :, :] *= sy
-            h_fp, w_fp = new_h, new_w
-
-        # 5) рабочий регион в координатах IMG
-        if region_coords is None:
-            y_region, x_region, reg_h, reg_w = 0, 0, H, W
-        else:
-            y_region, x_region, reg_h, reg_w = region_coords
-
-        max_y_start = y_region + reg_h - h_fp
-        min_y_start = y_region
-        max_x_start = x_region + reg_w - w_fp
-        min_x_start = x_region
-
-        if min_y_start > max_y_start or min_x_start > max_x_start:
-            return None, None, None
-
-        # 6) выбор (y0, x0) c ЗАПРЕТОМ сектора 30–150° от центра кадра
-        cx_img = W * 0.5
-        cy_img = H * 0.5
-
-        max_tries = 10
-        accepted = False
-        y0 = x0 = None
-
-        for _ in range(max_tries):
-            y0_try = np.random.randint(min_y_start, max_y_start + 1)
-            x0_try = np.random.randint(min_x_start, max_x_start + 1)
-
-            cx_txt = x0_try + 0.5 * w_fp
-            cy_txt = y0_try + 0.5 * h_fp
-
-            dx = cx_txt - cx_img
-            dy_math = cy_img - cy_txt  # "математическое" Y вверх
-
-            angle = np.degrees(np.arctan2(dy_math, dx))  # (-180, 180]
-            if angle < 0.0:
-                angle += 360.0  # [0, 360)
-
-            # 🔴 Запрещённый сектор: 30–150° (верх + чуть боков)
-            if 30.0 <= angle <= 150.0:
-                continue
-
-            y0, x0 = int(y0_try), int(x0_try)
-            accepted = True
-            break
-
-        if not accepted:
-            return None, None, None
-
-        # 7) оценка перспективы ИМЕННО в этом месте
-        bbox_global = (int(y0), int(x0), int(h_fp), int(w_fp))
-        alpha = 0.0
-        if depth is not None:
-            try:
-                alpha = self.estimate_perspective_from_depth_at_bbox(
-                    depth, bbox_global, max_alpha=0.9
+            if x1 <= x0 + 5 or y1 <= y0 + 5:
+                print(
+                    f"[OVERLAY] bbox too small after clamp: "
+                    f"x0={x0:.1f}, y0={y0:.1f}, x1={x1:.1f}, y1={y1:.1f}"
                 )
+                return None, None, None
+
+            margin_x = (x1 - x0) * 0.05
+            margin_y = (y1 - y0) * 0.10
+            x0i = int(round(x0 + margin_x))
+            x1i = int(round(x1 - margin_x))
+            y0i = int(round(y0 + margin_y))
+            y1i = int(round(y1 - margin_y))
+
+            if x1i <= x0i + 4 or y1i <= y0i + 4:
+                print(
+                    f"[OVERLAY] bbox collapsed after margin: "
+                    f"x0i={x0i}, y0i={y0i}, x1i={x1i}, y1i={y1i}"
+                )
+                return None, None, None
+
+            print(
+                f"[OVERLAY] final bbox for text: "
+                f"x0={x0i}, y0={y0i}, x1={x1i}, y1={y1i}"
+            )
+
+            W_reg = x1i - x0i
+            H_reg = y1i - y0i
+
+            # -------- 3. Рендер текста в локальный патч через pygame --------
+            try:
+                pygame.init()
             except Exception:
-                alpha = 0.0
+                pass
 
-        if alpha > 1e-3:
-            txt_arr, bb_char_fp = self.warp_text_with_pseudo_perspective_at_bbox(
-                txt_arr, bb_char_fp,
-                alpha=alpha,
-                bbox_global=bbox_global,
-                img_shape=(H, W),
-            )
-            h_fp, w_fp = txt_arr.shape[:2]
+            surf = pygame.Surface((W_reg, H_reg), flags=pygame.SRCALPHA)
+            surf.fill((0, 0, 0, 0))
 
-        # 8) собираем маску текста в координатах IMG
-        text_mask_img = np.zeros((H, W), np.uint8)
+            try:
+                font.origin = True
+            except Exception:
+                pass
 
-        end_y = min(y0 + h_fp, H)
-        end_x = min(x0 + w_fp, W)
-        h_to_copy = end_y - y0
-        w_to_copy = end_x - x0
+            base_size = getattr(font, "size", None)
+            if base_size is None:
+                base_size = int(max(8, min(H_reg, W_reg) / 2))
+                try:
+                    font.size = base_size
+                except Exception:
+                    pass
 
-        if h_to_copy <= 0 or w_to_copy <= 0:
+            # уменьшаем шрифт, пока текст не влезет в локальный bbox
+            for _ in range(12):
+                try:
+                    text_rect = font.get_rect(txt_str)
+                except Exception:
+                    try:
+                        text_rect = font.get_rect(txt_str)[0]
+                    except Exception as e:
+                        print("[OVERLAY] font.get_rect failed:", repr(e))
+                        return None, None, None
+
+                if (
+                    text_rect.width <= W_reg * 0.9
+                    and text_rect.height <= H_reg * 0.8
+                ):
+                    break
+                try:
+                    font.size = max(4, int(font.size * 0.9))
+                except Exception:
+                    pass
+
+            tx = (W_reg - text_rect.width) // 2
+            ty = (H_reg - text_rect.height) // 2 + text_rect.height
+
+            # ---- яркий цвет текста ----
+            bright_colors = [
+                (255, 255, 255),
+                (255, 255, 0),
+                (0, 255, 255),
+                (255, 128, 0),
+                (0, 255, 0),
+                (255, 0, 255),
+                (0, 128, 255),
+            ]
+            fg_color = random.choice(bright_colors)
+
+            try:
+                # Сначала зальём текстом (основной цвет)
+                font.render_to(surf, (tx, ty), txt_str, fg_color)
+            except Exception as e:
+                print("[OVERLAY] font.render_to failed:", repr(e))
+                return None, None, None
+
+            text_rgb = pygame.surfarray.pixels3d(surf).copy()
+            text_a = pygame.surfarray.pixels_alpha(surf).copy()
+            mask_local = (text_a > 0).astype(np.uint8) * 255
+
+            if int(mask_local.sum()) < 10:
+                print("[OVERLAY] empty text mask in local bbox")
+                return None, None, None
+
+            text_bgr = cv2.cvtColor(text_rgb, cv2.COLOR_RGB2BGR)
+
+            # -------- 3.1 Подсчёт числа символов (без пробелов) --------
+            chars = [c for c in txt_str if not c.isspace()]
+            n_chars = len(chars)
+
+            # >>> 3.2 Поворот патча текста по selected_angle <<< 
+            angle = 0.0
+            try:
+                if selected_angle is not None:
+                    angle = float(selected_angle)
+            except Exception:
+                angle = 0.0
+
+            if abs(angle) > 0.5:
+                h_t, w_t = mask_local.shape[:2]
+                center = (w_t / 2.0, h_t / 2.0)
+
+                M = cv2.getRotationMatrix2D(center, angle, 1.0)
+
+                text_bgr = cv2.warpAffine(
+                    text_bgr,
+                    M,
+                    (w_t, h_t),
+                    flags=cv2.INTER_LINEAR,
+                    borderMode=cv2.BORDER_CONSTANT,
+                    borderValue=(0, 0, 0),
+                )
+                mask_local = cv2.warpAffine(
+                    mask_local,
+                    M,
+                    (w_t, h_t),
+                    flags=cv2.INTER_NEAREST,
+                    borderMode=cv2.BORDER_CONSTANT,
+                    borderValue=0,
+                )
+
+                print(f"[OVERLAY] rotated text patch by {angle:.2f} deg")
+            else:
+                M = None  # на всякий случай
+
+            # -------- 3.3 Делаем текст чуть ТОНЬШЕ (лёгкая эрозия маски) --------
+            kernel_thin = np.ones((2, 2), np.uint8)
+            mask_thin = cv2.erode(mask_local, kernel_thin, iterations=1)
+            if mask_thin.sum() > 0:
+                mask_local = mask_thin
+
+            # -------- 4. Вклеиваем патч в исходное изображение + ЧЁРНАЯ ОБВОДКА --------
+            img_new = img.copy()
+            patch = img_new[y0i:y1i, x0i:x1i].copy()
+
+            if patch.shape[:2] != text_bgr.shape[:2]:
+                print("[OVERLAY] shape mismatch patch vs text, resizing text")
+                text_bgr = cv2.resize(
+                    text_bgr,
+                    (patch.shape[1], patch.shape[0])
+                )
+                mask_local = cv2.resize(
+                    mask_local,
+                    (patch.shape[1], patch.shape[0]),
+                    interpolation=cv2.INTER_NEAREST
+                )
+
+            # ---- 4.1 Аккуратное зеркалирование текста по вертикальной оси (лево↔право) ----
+            ys_m, xs_m = np.where(mask_local > 0)
+            if xs_m.size > 0 and ys_m.size > 0:
+                x0_m, x1_m = int(xs_m.min()), int(xs_m.max())
+                y0_m, y1_m = int(ys_m.min()), int(ys_m.max())
+
+                roi_y = slice(y0_m, y1_m + 1)
+                roi_x = slice(x0_m, x1_m + 1)
+
+                sub_text = text_bgr[roi_y, roi_x]
+                sub_mask = mask_local[roi_y, roi_x]
+
+                sub_text_flipped = cv2.flip(sub_text, 1)
+                sub_mask_flipped = cv2.flip(sub_mask, 1)
+
+                text_bgr[roi_y, roi_x] = sub_text_flipped
+                mask_local[roi_y, roi_x] = sub_mask_flipped
+
+                print(
+                    f"[OVERLAY] mirrored text horizontally inside ROI "
+                    f"x=[{x0_m},{x1_m}], y=[{y0_m},{y1_m}]"
+                )
+
+            # ---- строим контур: dilate(mask) - mask ----
+            kernel_outline = np.ones((3, 3), np.uint8)
+            dilated = cv2.dilate(mask_local, kernel_outline, iterations=2)
+            outline_mask = cv2.subtract(dilated, mask_local)
+            outline_mask = (outline_mask > 0).astype(np.uint8) * 255
+
+            # сначала кладём контур (чёрный), потом сам текст
+            m_outline = outline_mask.astype(bool)
+            m_text = mask_local.astype(bool)
+
+            # чёрный контур
+            patch[m_outline] = (0, 0, 0)
+
+            # цветной текст
+            patch[m_text] = text_bgr[m_text]
+
+            # 🔧 ВАЖНО: возвращаем обратно ровно в тот же x-срез
+            img_new[y0i:y1i, x0i:x1i] = patch
+
+            # глобальная маска (в координатах всей картинки) — только сам текст
+            text_mask_img = np.zeros((H, W), dtype=np.uint8)
+            text_mask_img[y0i:y1i, x0i:x1i] = mask_local
+
+            # -------- 5. Строим charBB по глобальной маске через PCA --------
+            charBB = None
+            if n_chars > 0:
+                ys, xs = np.where(text_mask_img > 0)
+                if xs.size == 0 or ys.size == 0:
+                    print("[OVERLAY] text_mask_img is empty, charBB=None")
+                    return img_new, None, text_mask_img
+
+                # точки в (x, y)
+                pts = np.stack([xs.astype(np.float32), ys.astype(np.float32)], axis=1)
+                mean = pts.mean(axis=0)  # (mx, my)
+                pts_centered = pts - mean[None, :]
+
+                # --- PCA, главная ось строки ---
+                cov = np.cov(pts_centered, rowvar=False)
+                evals, evecs = np.linalg.eigh(cov)
+                main_idx = int(np.argmax(evals))
+                d0 = evecs[:, main_idx].astype(np.float32)  # главная ось
+                norm = float(np.linalg.norm(d0))
+                if norm < 1e-6:
+                    d0 = np.array([1.0, 0.0], dtype=np.float32)
+                else:
+                    d0 /= norm
+
+                # направляем d0 вправо по X
+                if d0[0] < 0:
+                    d0 = -d0
+
+                # ортогональная ось (толщина строки)
+                d1 = np.array([-d0[1], d0[0]], dtype=np.float32)
+
+                # проекции точек на оси
+                us = pts_centered @ d0
+                vs = pts_centered @ d1
+                umin, umax = float(us.min()), float(us.max())
+                vmin, vmax = float(vs.min()), float(vs.max())
+
+                du = umax - umin
+                dv = vmax - vmin
+
+                # небольшой запас
+                umin -= 0.02 * du
+                umax += 0.02 * du
+                vmin -= 0.05 * dv
+                vmax += 0.05 * dv
+
+                charBB = np.zeros((2, 4, n_chars), dtype=np.float32)
+
+                for i in range(n_chars):
+                    t0 = float(i) / n_chars
+                    t1 = float(i + 1) / n_chars
+                    u0 = umin + t0 * (umax - umin)
+                    u1 = umin + t1 * (umax - umin)
+
+                    # 4 угла прямоугольника для i-го символа
+                    p0 = mean + u0 * d0 + vmin * d1
+                    p1 = mean + u1 * d0 + vmin * d1
+                    p2 = mean + u1 * d0 + vmax * d1
+                    p3 = mean + u0 * d0 + vmax * d1
+
+                    quad = np.stack([p0, p1, p2, p3], axis=0)  # (4, 2)
+                    charBB[0, :, i] = quad[:, 0]
+                    charBB[1, :, i] = quad[:, 1]
+
+                # обрезаем за границы изображения
+                charBB[0, :, :] = np.clip(charBB[0, :, :], 0, W - 1)
+                charBB[1, :, :] = np.clip(charBB[1, :, :], 0, H - 1)
+
+                print(f"[OVERLAY] charBB built from PCA for {n_chars} chars")
+            else:
+                print("[OVERLAY] no non-space chars, charBB=None")
+
+            return img_new, charBB, text_mask_img
+
+        except Exception as e:
+            import traceback
+            print("[OVERLAY] UNHANDLED EXCEPTION:", repr(e))
+            traceback.print_exc()
             return None, None, None
-
-        mask_fp = (txt_arr > 0).astype(np.uint8) * 255
-        text_mask_img[y0:end_y, x0:end_x] = np.maximum(
-            text_mask_img[y0:end_y, x0:end_x],
-            mask_fp[:h_to_copy, :w_to_copy],
-        )
-
-        nz_imgmask = int((text_mask_img > 0).sum())
-        if nz_imgmask == 0:
-            return None, None, None
-
-        # 9) переносим bbox в IMG-координаты
-        bb_img = bb_char_fp.copy()
-        bb_img[0, :, :] += x0
-        bb_img[1, :, :] += y0
-
-        # 10) базовая раскраска через Colorize
-        try:
-            min_h = self.get_min_h(bb_img, txt_str_norm)
-        except Exception:
-            return None, None, None
-
-        try:
-            img_colored = self.colorizer.color(
-                img.copy(), [text_mask_img], np.array([min_h])
-            )
-        except Exception:
-            return None, None, None
-
-        text_region = (text_mask_img > 0)
-        nz_text_region = int(text_region.sum())
-
-        # 11) Усиливаем яркость текста + тёмная обводка
-        if nz_text_region > 0:
-            img_f = img_colored.astype(np.float32)
-
-            # яркость / "неон"
-            bright_factor = 1.5
-            img_f[text_region] *= bright_factor
-            img_f = np.clip(img_f, 0, 255)
-            img_colored = img_f.astype(np.uint8)
-
-            # обводка
-            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-            dil = cv2.dilate(text_mask_img, kernel, 1)
-            er = cv2.erode(text_mask_img, kernel, 1)
-            outline = ((dil > 0) & (er == 0))
-
-            if int(outline.sum()) > 0:
-                img_f = img_colored.astype(np.float32)
-                dark_factor = 0.25
-                img_f[outline] *= dark_factor
-                img_colored = np.clip(img_f, 0, 255).astype(np.uint8)
-
-        # Финальный "неонный" буст
-        img_colored = self._boost_text_neon(img_colored, text_mask_img)
-
-        return img_colored, bb_img, text_mask_img
 
 
 
@@ -2930,14 +3327,37 @@ class RendererV3(object):
         h = h[alnum]
         return np.min(h)
 
-    def get_num_text_regions(self, nregions):
-        #return nregions
-        nmax = min(self.max_text_regions, nregions)
-        if np.random.rand() < 0.10:
-            rnd = np.random.rand()
-        else:
-            rnd = np.random.beta(5.0,1.0)
-        return int(np.ceil(nmax * rnd))
+    def get_num_text_regions(self, nregions: int) -> int:
+        """
+        Сколько текстовых блоков (здесь = СЛОВ) пытаться разместить на изображении.
+
+        Ограничения:
+        - по умолчанию 2–4 слова на картинку;
+        - но не больше количества доступных регионов nregions.
+        При желании можно переопределить self.min_words_per_image / self.max_words_per_image.
+        """
+        import numpy as np
+
+        # Диапазон слов на изображении по умолчанию
+        default_min = 2
+        default_max = 4
+
+        # Можно переопределить извне как атрибуты объекта
+        min_blocks = int(getattr(self, "min_words_per_image", default_min))
+        max_blocks = int(getattr(self, "max_words_per_image", default_max))
+
+        if max_blocks < min_blocks:
+            max_blocks = min_blocks
+
+        if nregions <= 0:
+            return 0
+
+        # случайное число блоков (слов) в этом кадре
+        k = int(np.random.randint(min_blocks, max_blocks + 1))
+
+        # не больше числа регионов
+        k = max(1, min(k, int(nregions)))
+        return k
 
     def char2wordBB(self, charBB, text,
                 pad_px=0, pad_rel=0.0, clamp_shape=None):
@@ -2981,13 +3401,12 @@ class RendererV3(object):
 
 
 
-    # synthgen.py — внутри class RendererV3
-        # synthgen.py — внутри class RendererV3
     def render_text(self, rgb, depth, seg, area, label, ninstance=1, viz=False):
         """
         Основной генератор:
         1) строит регионы и их place_mask,
-        2) несколько раз пытается разместить текст по стратегии text-first,
+        2) несколько раз пытается разместить текст по стратегии text-first
+           (ТЕПЕРЬ: один блок = одно слово),
         3) следит за глобальными коллизиями,
         4) добавляет шум / затемнение,
         5) при viz=True рисует дебаг-картинки.
@@ -3002,12 +3421,27 @@ class RendererV3(object):
 
         # --- строим регионы и place_mask ---
         try:
-            # Регионы по сегментации (геометрию по глубине мы уже отключили)
-            regions = TextRegions.get_regions(None, seg, area, label)
+            print("[render_text] start: rgb_shape =", rgb.shape, ", seg_shape =", seg.shape, ", ninstance =", ninstance)
 
-            # Превращаем их в place_mask + единичные H/Hinv
-            regions = self.filter_for_placement(None, seg, regions)
-            if len(regions.get('place_mask', [])) == 0:
+            # 1) xyz из depth – как в оригинале SynthText
+            xyz = su.DepthCamera.depth2xyz(depth)
+
+            # 2) регионы по сегментации
+            regions = TextRegions.get_regions(xyz, seg, area, label)
+            print("[render_text] TextRegions.get_regions ->", len(regions["label"]), "raw regions")
+
+            # 3) отфильтровали только планарные области (подбираем одну плоскость на регион)
+            regions = TextRegions.filter_depth(xyz, seg, regions)
+            print("[render_text] TextRegions.filter_depth ->", len(regions["label"]), "planar regions")
+
+            # 4) строим fronto-parallel маски и гомографии, как в оригинальном коде
+            regions = self.filter_for_placement(xyz, seg, regions)
+
+            # --- важный ранний выход: НИЧЕГО НЕ НАШЛИ -> вернём ПУСТОЙ СПИСОК ---
+            if regions is None or len(regions.get("place_mask", [])) == 0:
+                print("[render_text] no regions after filter_for_placement, early exit")
+
+                # опционально сохраним дебаг-картинки
                 try:
                     _save_img(f"{_stamp()}_DBG_rgb.png", rgb)
                     _save_img(
@@ -3020,11 +3454,13 @@ class RendererV3(object):
                 except Exception:
                     pass
 
+                return []  # <--- ВАЖНО: список, а не (rgb, None, None)
+
             nregions = len(regions['place_mask'])
             if nregions < 1:
                 return []
 
-            # сколько блоков хотим в среднем
+            # сколько блоков (слов) хотим в среднем
             target_blocks = self.get_num_text_regions(nregions)
 
             # динамические бюджеты (сколько попыток на картинку и на регион)
@@ -3034,7 +3470,8 @@ class RendererV3(object):
             self.global_attempt_budget = global_budget
             self.per_region_attempt_cap = per_region_cap
             self._max_shrink_trials_runtime = max_shrink_trials
-        except Exception:
+        except Exception as e:
+            print("[render_text] exception during region prep:", repr(e))
             return []
 
         res = []
@@ -3047,7 +3484,7 @@ class RendererV3(object):
             # глобальная карта занятости в координатах изображения
             occupied_global = np.zeros(img.shape[:2], dtype=np.uint8)
 
-            # сколько текстовых блоков хотим в этом экземпляре
+            # сколько текстовых блоков (слов) хотим в этом экземпляре
             target_blocks = self.get_num_text_regions(nregions)
 
             attempts_left = int(getattr(self, "global_attempt_budget", 10))
@@ -3092,7 +3529,7 @@ class RendererV3(object):
 
                 # Фиксируем картинку и аннотации
                 img = img_new
-                itext.append(text)
+                itext.append(text)   # ОДНО СЛОВО на блок
                 ibb.append(bb)
                 placed_count += 1
 
@@ -3110,6 +3547,7 @@ class RendererV3(object):
 
             H, W = img.shape[:2]
             if idict['charBB'] is not None:
+                # text = "слово1 слово2 ...", wordBB на каждое слово
                 idict['wordBB'] = self.char2wordBB(
                     idict['charBB'].copy(), ' '.join(itext),
                     pad_px=4, pad_rel=0.05, clamp_shape=(H, W)
@@ -3148,6 +3586,3 @@ class RendererV3(object):
             res.append(idict.copy())
 
         return res
-
-
-

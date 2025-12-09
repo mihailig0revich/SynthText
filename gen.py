@@ -270,13 +270,33 @@ def _maybe_roll_output_h5(out_db, out_path, base_path, index, max_gb: float):
 
 
 def main(viz=False):
-    # --- ищем входные .h5 ---
-    input_files = list_input_h5_files()
+    # --- спрашиваем у пользователя папку с .h5 ---
+    try:
+        user_dir = input(
+            f"\nВведите путь к ПАПКЕ, из которой читать .h5-файлы\n"
+            f"[Enter = использовать по умолчанию: {INPUT_DIR}]\n> "
+        ).strip()
+    except EOFError:
+        # если запускается без stdin (на всякий случай)
+        user_dir = ""
+
+    if user_dir:
+        selected_input_dir = user_dir
+    else:
+        selected_input_dir = INPUT_DIR
+
+    # --- ищем входные .h5 с учётом выбранной папки ---
+    input_files = list_input_h5_files(
+        input_dir=selected_input_dir,
+        fallback=DB_FNAME
+    )
+
     print(colorize(
         Color.BLUE,
-        f"Нашёл {len(input_files)} .h5-файлов для обработки:",
+        f"\nНашёл {len(input_files)} .h5-файлов для обработки:",
         bold=True
     ))
+    print("   Папка ввода:", selected_input_dir)
     for p in input_files:
         print("   ", p)
 
@@ -403,6 +423,7 @@ def main(viz=False):
         db.close()
 
     out_db.close()
+
 
 
 
