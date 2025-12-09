@@ -304,9 +304,29 @@ def main(viz=False):
     os.makedirs(osp.dirname(OUT_FILE), exist_ok=True)
     os.makedirs(PNG_DIR, exist_ok=True)
 
-    print(colorize(Color.GREEN, 'Storing the output in: ' + OUT_FILE, bold=True))
-    out_db = h5py.File(OUT_FILE, 'w')
-    out_db.create_group('/data')
+    # --- выбор выходного H5 в зависимости от viz ---
+    if viz:
+        # Режим отладки: всегда один и тот же файл
+        out_index = 0
+        out_path = OUT_FILE
+        print(colorize(
+            Color.GREEN,
+            'Storing the output in: ' + out_path,
+            bold=True
+        ))
+        out_db = h5py.File(out_path, 'w')
+        out_db.create_group('/data')
+    else:
+        # Боевой режим: ищем первый СВОБОДНЫЙ индекс
+        out_index = 0
+        while True:
+            candidate_path = _make_out_path_with_index(OUT_FILE, out_index)
+            if not osp.exists(candidate_path):
+                break
+            out_index += 1
+
+        out_db, out_path = _open_out_h5(OUT_FILE, out_index)
+        # _open_out_h5 сам делает create_group('/data') и печатает путь
 
     # Рендерер один на все входные файлы
     RV3 = RendererV3(RENDER_DATA_PATH, max_time=SECS_PER_IMG)
@@ -393,6 +413,17 @@ def main(viz=False):
                             bold=True
                         ))
                         saved_any = True
+
+                        # если мы не в viz-режиме — проверяем размер и при необходимости
+                        # переключаемся на НОВЫЙ файл с увеличенным индексом
+                        if not viz:
+                            out_db, out_path, out_index = _maybe_roll_output_h5(
+                                out_db,
+                                out_path,
+                                OUT_FILE,
+                                out_index,
+                                max_gb=MAX_H5_SIZE_GB,
+                            )
                         break
                     else:
                         print(colorize(
@@ -423,6 +454,7 @@ def main(viz=False):
         db.close()
 
     out_db.close()
+
 
 
 
