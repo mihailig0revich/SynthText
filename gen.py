@@ -61,6 +61,83 @@ REPEATS_PER_IMAGE = 2
 MAX_H5_SIZE_GB = 10.0
 # -----------------------------------------------------------------
 
+import os, sys, traceback
+import time
+
+def _lock_path_for(h5_path: str) -> str:
+    return h5_path + ".lock"
+
+
+def _acquire_lock_or_none(h5_path: str) -> str | None:
+    """
+    Атомарно создаёт lock-файл рядом с h5. Если lock уже есть — возвращает None.
+    Работает кроссплатформенно (Windows тоже).
+    """
+    lp = _lock_path_for(h5_path)
+    try:
+        fd = os.open(lp, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        os.write(fd, f"pid={os.getpid()} time={time.time()}".encode("utf-8"))
+        os.close(fd)
+        return lp
+    except FileExistsError:
+        return None
+
+
+def _release_lock(lock_path: str | None):
+    if not lock_path:
+        return
+    try:
+        os.remove(lock_path)
+    except OSError:
+        pass
+
+
+def _open_out_h5_locked(path: str):
+    """
+    Открывает ИМЕННО этот путь, но только если удалось взять lock.
+    Возвращает (h5_file, path, lock_path).
+    """
+    os.makedirs(osp.dirname(path), exist_ok=True)
+    lock_path = _acquire_lock_or_none(path)
+    if lock_path is None:
+        raise RuntimeError(f"Output H5 is already in use by another process: {path}")
+
+    try:
+        f = h5py.File(path, 'w')
+        f.create_group('/data')
+        print(colorize(Color.GREEN, f"[H5] Opened output file: {path}", bold=True))
+        return f, path, lock_path
+    except Exception:
+        _release_lock(lock_path)
+        raise
+
+
+def _open_out_h5_next_free(base_path: str, start_index: int = 0):
+    """
+    Находит "следующий свободный" output-файл БЕЗ гонки:
+    - для каждого кандидата пытается atomically взять lock;
+    - кто lock взял — тот и пишет.
+    Возвращает (h5_file, path, index, lock_path).
+    """
+    idx = int(start_index)
+    while True:
+        path = _make_out_path_with_index(base_path, idx)
+        os.makedirs(osp.dirname(path), exist_ok=True)
+
+        lock_path = _acquire_lock_or_none(path)
+        if lock_path is None:
+            idx += 1
+            continue
+
+        try:
+            f = h5py.File(path, 'w')
+            f.create_group('/data')
+            print(colorize(Color.GREEN, f"[H5] Opened output file: {path}", bold=True))
+            return f, path, idx, lock_path
+        except Exception:
+            _release_lock(lock_path)
+            raise
+
 
 def list_input_h5_files(input_dir=INPUT_DIR, fallback=DB_FNAME):
     """
@@ -236,11 +313,11 @@ def _open_out_h5(base_path: str, index: int):
     return f, path
 
 
-def _maybe_roll_output_h5(out_db, out_path, base_path, index, max_gb: float):
+def _maybe_roll_output_h5(out_db, out_path, out_lock_path, base_path, index, max_gb: float):
     """
     Проверяет размер текущего H5-файла.
-    Если размер >= max_gb, закрывает его и открывает новый с индексом +1.
-    Возвращает (out_db, out_path, new_index).
+    Если размер >= max_gb, закрывает его, освобождает lock и открывает новый (без гонки).
+    Возвращает (out_db, out_path, new_index, out_lock_path).
     """
     try:
         out_db.flush()
@@ -248,24 +325,24 @@ def _maybe_roll_output_h5(out_db, out_path, base_path, index, max_gb: float):
         pass
 
     try:
-        if osp.exists(out_path):
-            size_bytes = os.path.getsize(out_path)
-        else:
-            size_bytes = 0
+        size_bytes = os.path.getsize(out_path) if osp.exists(out_path) else 0
     except Exception:
         size_bytes = 0
 
     if size_bytes >= max_gb * (1024 ** 3):
-        # закрываем текущий и открываем новый
+        # закрываем текущий
         try:
             out_db.close()
         except Exception:
             pass
-        new_index = index + 1
-        out_db, out_path = _open_out_h5(base_path, new_index)
-        return out_db, out_path, new_index
-    else:
-        return out_db, out_path, index
+        _release_lock(out_lock_path)
+
+        # открываем следующий свободный (начиная с index+1)
+        out_db, out_path, new_index, out_lock_path = _open_out_h5_next_free(base_path, index + 1)
+        return out_db, out_path, new_index, out_lock_path
+
+    return out_db, out_path, index, out_lock_path
+
 
 # =======================================================================
 
@@ -278,13 +355,9 @@ def main(viz=False):
             f"[Enter = использовать по умолчанию: {INPUT_DIR}]\n> "
         ).strip()
     except EOFError:
-        # если запускается без stdin (на всякий случай)
         user_dir = ""
 
-    if user_dir:
-        selected_input_dir = user_dir
-    else:
-        selected_input_dir = INPUT_DIR
+    selected_input_dir = user_dir if user_dir else INPUT_DIR
 
     # --- ищем входные .h5 с учётом выбранной папки ---
     input_files = list_input_h5_files(
@@ -305,156 +378,161 @@ def main(viz=False):
     os.makedirs(osp.dirname(OUT_FILE), exist_ok=True)
     os.makedirs(PNG_DIR, exist_ok=True)
 
-    # --- выбор выходного H5 в зависимости от viz ---
+    # --- выбор/открытие выходного H5 с lock (защита от двух консолей) ---
+    out_db = None
+    out_path = None
+    out_index = 0
+    out_lock_path = None
+
     if viz:
-        # Режим отладки: всегда один и тот же файл
-        out_index = 0
+        # Режим отладки: один и тот же файл, но с lock (чтобы 2 консоли не убили H5)
         out_path = OUT_FILE
-        print(colorize(
-            Color.GREEN,
-            'Storing the output in: ' + out_path,
-            bold=True
-        ))
-        out_db = h5py.File(out_path, 'w')
-        out_db.create_group('/data')
-    else:
-        # Боевой режим: ищем первый СВОБОДНЫЙ индекс
+        print(colorize(Color.GREEN, 'Storing the output in: ' + out_path, bold=True))
+        out_db, out_path, out_lock_path = _open_out_h5_locked(out_path)
         out_index = 0
-        while True:
-            candidate_path = _make_out_path_with_index(OUT_FILE, out_index)
-            if not osp.exists(candidate_path):
-                break
-            out_index += 1
+    else:
+        # Боевой режим: следующий свободный индекс БЕЗ гонки (через lock)
+        out_db, out_path, out_index, out_lock_path = _open_out_h5_next_free(OUT_FILE, 0)
 
-        out_db, out_path = _open_out_h5(OUT_FILE, out_index)
-        # _open_out_h5 сам делает create_group('/data') и печатает путь
+    try:
+        # Рендерер один на все входные файлы
+        RV3 = RendererV3(RENDER_DATA_PATH, max_time=SECS_PER_IMG)
 
-    # Рендерер один на все входные файлы
-    RV3 = RendererV3(RENDER_DATA_PATH, max_time=SECS_PER_IMG)
+        # Счётчик обработанных изображений по всем .h5 сразу
+        global_idx = 0
 
-    # Счётчик обработанных изображений по всем .h5 сразу
-    global_idx = 0
+        # --- основной цикл по входным файлам ---
+        for file_idx, h5_path in enumerate(input_files):
+            print(colorize(
+                Color.MAGENTA,
+                f"[INPUT] {file_idx + 1}/{len(input_files)}: {h5_path}",
+                bold=True
+            ))
 
-    # --- основной цикл по входным файлам ---
-    for file_idx, h5_path in enumerate(input_files):
-        print(colorize(
-            Color.MAGENTA,
-            f"[INPUT] {file_idx + 1}/{len(input_files)}: {h5_path}",
-            bold=True
-        ))
+            try:
+                db = get_data(h5_path)
+            except Exception:
+                traceback.print_exc()
+                print(colorize(Color.RED, "[H5] не удалось открыть файл, пропускаю", bold=True))
+                continue
 
-        try:
-            db = get_data(h5_path)
-        except Exception:
-            traceback.print_exc()
-            print(colorize(Color.RED, "[H5] не удалось открыть файл, пропускаю", bold=True))
-            continue
+            # берём группы img/depth/seg
+            try:
+                img_g,   img_g_name   = pick_group(db, ['images', 'image', 'img'])
+                depth_g, depth_g_name = pick_group(db, ['depth', 'depths'])
+                seg_g,   seg_g_name   = pick_group(db, ['seg', 'segs', 'mask'])
 
-        # берём группы img/depth/seg
-        try:
-            img_g,   img_g_name   = pick_group(db, ['images', 'image', 'img'])
-            depth_g, depth_g_name = pick_group(db, ['depth', 'depths'])
-            seg_g,   seg_g_name   = pick_group(db, ['seg', 'segs', 'mask'])
+                common = sorted(set(img_g.keys()) & set(depth_g.keys()) & set(seg_g.keys()))
+                if not common:
+                    print(colorize(
+                        Color.YELLOW,
+                        "[H5] Нет общих ключей между группами image/depth/seg, пропускаю файл",
+                        bold=True
+                    ))
+                    db.close()
+                    continue
 
-            common = sorted(set(img_g.keys()) & set(depth_g.keys()) & set(seg_g.keys()))
-            if not common:
-                print(colorize(
-                    Color.YELLOW,
-                    "[H5] Нет общих ключей между группами image/depth/seg, пропускаю файл",
-                    bold=True
-                ))
+                print(f"[H5] using groups: image='{img_g_name}', depth='{depth_g_name}', seg='{seg_g_name}'")
+            except Exception:
+                traceback.print_exc()
+                print(colorize(Color.RED, "[H5] Ошибка при разборе групп, пропускаю файл", bold=True))
                 db.close()
                 continue
 
-            print(f"[H5] using groups: image='{img_g_name}', depth='{depth_g_name}', seg='{seg_g_name}'")
-        except Exception:
-            traceback.print_exc()
-            print(colorize(Color.RED, "[H5] Ошибка при разборе групп, пропускаю файл", bold=True))
-            db.close()
-            continue
+            # Ограничение NUM_IMG на каждый входной .h5 (как и раньше)
+            n_in_file = len(common) if NUM_IMG <= 0 else min(NUM_IMG, len(common))
 
-        # Ограничение NUM_IMG на каждый входной .h5 (как и раньше)
-        n_in_file = len(common) if NUM_IMG <= 0 else min(NUM_IMG, len(common))
+            for i, imname in enumerate(common[:n_in_file]):
+                global_idx += 1
+                try:
+                    img_np = np.array(img_g[imname][:])
+                    img_pil = Image.fromarray(img_np)
+                    depth = _read_depth_to_hw_float(depth_g[imname])
+                    seg, area, label = _seg_with_attrs(seg_g[imname])
 
-        for i, imname in enumerate(common[:n_in_file]):
-            global_idx += 1
-            try:
-                img_np = np.array(img_g[imname][:])
-                img_pil = Image.fromarray(img_np)
-                depth = _read_depth_to_hw_float(depth_g[imname])
-                seg, area, label = _seg_with_attrs(seg_g[imname])
+                    sz = depth.shape[:2][::-1]
+                    img = np.array(img_pil.resize(sz, RESAMPLE))
+                    seg = np.array(Image.fromarray(seg).resize(sz, RESAMPLE_NEAREST))
+                    depth, seg = clean_depth_and_seg(depth, seg)
 
-                sz = depth.shape[:2][::-1]
-                img = np.array(img_pil.resize(sz, RESAMPLE))
-                seg = np.array(Image.fromarray(seg).resize(sz, RESAMPLE_NEAREST))
-                depth, seg = clean_depth_and_seg(depth, seg)
-
-                print(colorize(
-                    Color.RED,
-                    f'{global_idx} (file {file_idx + 1}/{len(input_files)}, '
-                    f'img {i + 1}/{n_in_file})',
-                    bold=True
-                ))
-
-                saved_any = False
-                for attempt in range(1, MAX_GLOBAL_TRIES + 1):
-                    res = RV3.render_text(
-                        img, depth, seg, area, label,
-                        ninstance=INSTANCE_PER_IMAGE,
-                        viz=viz,
-                    )
-
-                    if res and len(res) > 0 and isinstance(res[0].get('img', []), np.ndarray):
-                        # сохраняем ТОЛЬКО в H5
-                        add_res_to_db(imname, res, out_db)
-
-                        print(colorize(
-                            Color.GREEN,
-                            f"[OK] saved {len(res)} instance(s) for '{imname}' into H5 (attempt {attempt})",
-                            bold=True
-                        ))
-                        saved_any = True
-
-                        # если мы не в viz-режиме — проверяем размер и при необходимости
-                        # переключаемся на НОВЫЙ файл с увеличенным индексом
-                        if not viz:
-                            out_db, out_path, out_index = _maybe_roll_output_h5(
-                                out_db,
-                                out_path,
-                                OUT_FILE,
-                                out_index,
-                                max_gb=MAX_H5_SIZE_GB,
-                            )
-                        break
-                    else:
-                        print(colorize(
-                            Color.YELLOW,
-                            f"[WARN] attempt {attempt}: no placement, retrying...",
-                            bold=True
-                        ))
-
-                if not saved_any:
-                    print(colorize(Color.RED, "[FAIL] all attempts failed for this image", bold=True))
-
-                if viz:
-                    ans = input(colorize(
+                    print(colorize(
                         Color.RED,
-                        'continue? (enter to continue, q to exit): ',
-                        True
+                        f'{global_idx} (file {file_idx + 1}/{len(input_files)}, '
+                        f'img {i + 1}/{n_in_file})',
+                        bold=True
                     ))
-                    if 'q' in ans:
-                        db.close()
-                        out_db.close()
-                        return
 
-            except Exception:
-                traceback.print_exc()
-                print(colorize(Color.GREEN, '>>>> CONTINUING....', bold=True))
-                continue
+                    saved_any = False
+                    for attempt in range(1, MAX_GLOBAL_TRIES + 1):
+                        res = RV3.render_text(
+                            img, depth, seg, area, label,
+                            ninstance=INSTANCE_PER_IMAGE,
+                            viz=viz,
+                        )
 
-        db.close()
+                        if res and len(res) > 0 and isinstance(res[0].get('img', []), np.ndarray):
+                            # сохраняем ТОЛЬКО в H5
+                            add_res_to_db(imname, res, out_db)
 
-    out_db.close()
+                            print(colorize(
+                                Color.GREEN,
+                                f"[OK] saved {len(res)} instance(s) for '{imname}' into H5 (attempt {attempt})",
+                                bold=True
+                            ))
+                            saved_any = True
+
+                            # если мы не в viz-режиме — проверяем размер и при необходимости
+                            # переключаемся на НОВЫЙ файл с увеличенным индексом (и новым lock)
+                            if not viz:
+                                out_db, out_path, out_index, out_lock_path = _maybe_roll_output_h5(
+                                    out_db,
+                                    out_path,
+                                    out_lock_path,
+                                    OUT_FILE,
+                                    out_index,
+                                    max_gb=MAX_H5_SIZE_GB,
+                                )
+                            break
+                        else:
+                            print(colorize(
+                                Color.YELLOW,
+                                f"[WARN] attempt {attempt}: no placement, retrying...",
+                                bold=True
+                            ))
+
+                    if not saved_any:
+                        print(colorize(Color.RED, "[FAIL] all attempts failed for this image", bold=True))
+
+                    if viz:
+                        ans = input(colorize(
+                            Color.RED,
+                            'continue? (enter to continue, q to exit): ',
+                            True
+                        ))
+                        if 'q' in ans:
+                            db.close()
+                            try:
+                                out_db.close()
+                            finally:
+                                _release_lock(out_lock_path)
+                            return
+
+                except Exception:
+                    traceback.print_exc()
+                    print(colorize(Color.GREEN, '>>>> CONTINUING....', bold=True))
+                    continue
+
+            db.close()
+
+    finally:
+        # гарантированно закрываем и освобождаем lock даже при исключениях
+        try:
+            if out_db is not None:
+                out_db.close()
+        finally:
+            _release_lock(out_lock_path)
+
+
 
 
 

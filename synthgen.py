@@ -2647,7 +2647,7 @@ class   RendererV3(object):
         import math
 
         H, W = warped_a_full.shape[:2]
-        log = bool(getattr(self, "overlay_occ_log", True))
+        log = bool(getattr(self, "overlay_occ_log", False))
 
         alpha_thr = int(alpha_thr)
         text_mask = (warped_a_full > alpha_thr)
