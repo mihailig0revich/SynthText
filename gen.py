@@ -43,23 +43,24 @@ NUM_IMG = -1              # -1 = все
 INSTANCE_PER_IMAGE = 1
 SECS_PER_IMG = 5
 
-# Папка, откуда берём входные .h5
-INPUT_DIR = r"C:\code\SynthText-python3\input"
+# Папка, откуда берём входные .h5 (относительно корня проекта / текущей директории)
+INPUT_DIR = "input"
 
 # Резервный старый путь (если в INPUT_DIR не окажется ни одного .h5)
-DB_FNAME = r"C:\code\SynthText-python3\street\bg_data\bg_data.h5"
+DB_FNAME = osp.join("street", "bg_data", "bg_data.h5")
 
 # Папка с ресурсами для текста (корпус + шрифты)
-RENDER_DATA_PATH = r"C:\code\SynthText-python3\data"
+RENDER_DATA_PATH = "data"
 
-# Пути для сохранения
-OUT_FILE = 'results/SynthText.h5'
-PNG_DIR  = 'results_png'   # <<< вот её как раз и не хватало
+# Пути для сохранения (также относительные)
+OUT_FILE = osp.join("results", "SynthText.h5")
+PNG_DIR  = "results_png"
 MAX_GLOBAL_TRIES = 8
-
+REPEATS_PER_IMAGE = 2
 # NEW: лимит размера одного выходного H5-файла (в гигабайтах)
-MAX_H5_SIZE_GB = 15.0
+MAX_H5_SIZE_GB = 10.0
 # -----------------------------------------------------------------
+
 
 def list_input_h5_files(input_dir=INPUT_DIR, fallback=DB_FNAME):
     """

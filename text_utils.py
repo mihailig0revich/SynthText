@@ -75,15 +75,74 @@ def move_bb(bbs, t):
 
 def crop_safe(arr, rect, bbs=[], pad=0):
     """
-    Быстрая "no-op" версия:
-    - не обрезает изображение,
-    - не трогает bbox'ы,
-    - оставлена для совместимости по сигнатуре.
+    Обрезает 2D-массив (H,W) по прямоугольнику rect (x,y,w,h),
+    с паддингом pad, и сдвигает bbox'ы (если переданы) в тех же координатах.
 
-    Возвращает:
-        arr, bbs
+    arr : 2D ndarray (H,W)
+    rect: pygame.Rect или (x,y,w,h) или (x0,y0,x1,y1)
+    bbs : ndarray Nx4 в формате [x,y,w,h] (как у тебя в render_multiline)
     """
-    return arr, bbs
+    import numpy as np
+
+    a = np.asarray(arr)
+    H, W = a.shape[:2]
+
+    # --- распарсить rect ---
+    x0 = y0 = x1 = y1 = None
+
+    if rect is None:
+        # fallback: кроп по ненулевым пикселям
+        ys, xs = np.where(a > 0)
+        if xs.size == 0:
+            return a, bbs
+        x0, x1 = int(xs.min()), int(xs.max()) + 1
+        y0, y1 = int(ys.min()), int(ys.max()) + 1
+    else:
+        # pygame.Rect-like
+        if hasattr(rect, "x") and hasattr(rect, "y") and hasattr(rect, "w") and hasattr(rect, "h"):
+            x0 = int(rect.x)
+            y0 = int(rect.y)
+            x1 = int(rect.x + rect.w)
+            y1 = int(rect.y + rect.h)
+        else:
+            r = np.asarray(rect).ravel().tolist()
+            if len(r) == 4:
+                a0, b0, c0, d0 = r
+                # пробуем (x,y,w,h)
+                if c0 >= 0 and d0 >= 0 and (a0 + c0) > a0 and (b0 + d0) > b0:
+                    x0 = int(a0); y0 = int(b0); x1 = int(a0 + c0); y1 = int(b0 + d0)
+                else:
+                    # (x0,y0,x1,y1)
+                    x0 = int(a0); y0 = int(b0); x1 = int(c0); y1 = int(d0)
+            else:
+                # fallback: кроп по ненулевым
+                ys, xs = np.where(a > 0)
+                if xs.size == 0:
+                    return a, bbs
+                x0, x1 = int(xs.min()), int(xs.max()) + 1
+                y0, y1 = int(ys.min()), int(ys.max()) + 1
+
+    # --- pad + clamp ---
+    pad = int(max(0, pad))
+    x0 = max(0, x0 - pad); y0 = max(0, y0 - pad)
+    x1 = min(W, x1 + pad); y1 = min(H, y1 + pad)
+
+    if x1 <= x0 or y1 <= y0:
+        return a, bbs
+
+    out = a[y0:y1, x0:x1]
+
+    # --- сдвинуть bbox'ы ---
+    if bbs is not None and len(bbs) > 0:
+        b = np.asarray(bbs).copy()
+        # ожидаем Nx4: x,y,w,h
+        if b.ndim == 2 and b.shape[1] >= 4:
+            b[:, 0] -= x0
+            b[:, 1] -= y0
+        bbs = b
+
+    return out, bbs
+
 
 
 
@@ -116,7 +175,6 @@ class RenderFont(object):
 
     def __init__(self, data_dir='data'):
         # distribution over the type of text:
-        # whether to get a single word, paragraph or a line:
         self.p_text = {
             'WORD': 1.0,
             'LINE': 0.0,
@@ -125,81 +183,101 @@ class RenderFont(object):
 
         ## TEXT PLACEMENT PARAMETERS:
         self.f_shrink = 0.90
-        self.max_shrink_trials = 5 # 0.9^5 ~= 0.6
-        # the minimum number of characters that should fit in a mask
-        # to define the maximum font height.
+        self.max_shrink_trials = 5
         self.min_nchar = 2
-        self.min_font_h = 16 #px : 0.6*12 ~ 7px <= actual minimum height
-        self.max_font_h = 500 #px
+        self.min_font_h = 16
+        self.max_font_h = 500
         self.p_flat = 0.0
-        self.char_gap_px = 0     # тонкий tracking
+
+        # пробел между словами (оставим как было)
         self.word_gap_px = 8
+        self.char_gap_rel = 0.08    # чуть больше расстояние между буквами
+        self.char_gap_px = 0        # можно 0..1
+        self.text_widen_scale = 1.0 # не растягивать
+
+        # --- жирность / морфология ---
+        # По умолчанию = 0 (никакой "жирности" — чтобы буквы не склеивались)
+        self.stroke_px = 1
+        self.stroke_mode = "edge"   # важно: edge, не dilate
 
         # curved baseline:
         self.p_curved = 0
         self.baselinestate = 0.05
 
         # text-source : gets english text:
-        self.text_source = TextSource(min_nchar=self.min_nchar,
-                                      fn=osp.join(data_dir,'newsgroup/newsgroup.txt'))
+        self.text_source = TextSource(
+            min_nchar=self.min_nchar,
+            fn=osp.join(data_dir, 'newsgroup/newsgroup.txt')
+        )
 
         # get font-state object:
         self.font_state = FontState(data_dir)
 
         pygame.init()
 
-    def render_multiline(self,font,text):
+    def render_multiline(self, font, text):
         """
-        renders multiline TEXT on the pygame surface SURF with the
-        font style FONT.
-        A new line in text is denoted by \n, no other characters are 
-        escaped. Other forms of white-spaces should be converted to space.
-
-        returns the updated surface, words and the character bounding boxes.
+        Рендерит multiline текст на pygame surface и возвращает:
+        surf_arr : (H,W) uint8 (0..255) маска (alpha)
+        words    : строка (нормализованные пробелы)
+        bbs      : Nx4 [x,y,w,h] bbox каждого символа
         """
-        # get the number of lines
-        lines = text.split('\n')
-        lengths = [len(l) for l in lines]
+        import numpy as np
+        import pygame
 
-        # font parameters:
+        lines = str(text).split('\n')
+        lengths = [len(l) for l in lines] if lines else [0]
+
         line_spacing = font.get_sized_height() + 1
-        
-        # initialize the surface to proper size:
-        line_bounds = font.get_rect(lines[np.argmax(lengths)])
-        fsize = (round(2.0*line_bounds.width), round(1.25*line_spacing*len(lines)))
+
+        # размер поверхности
+        line_bounds = font.get_rect(lines[np.argmax(lengths)] if lines else "O")
+        fsize = (int(round(2.0 * line_bounds.width)), int(round(1.25 * line_spacing * max(1, len(lines)))))
+
         surf = pygame.Surface(fsize, pygame.locals.SRCALPHA, 32)
 
         bbs = []
         space = font.get_rect('O')
         x, y = 0, 0
-        for l in lines:
-            x = 0 # carriage-return
-            y += line_spacing # line-feed
 
-            for ch in l: # render each character
-                if ch.isspace(): # just shift
+        for l in lines:
+            x = 0
+            y += line_spacing
+
+            for ch in l:
+                if ch.isspace():
                     x += space.width
                 else:
-                    # render the character
-                    ch_bounds = font.render_to(surf, (x,y), ch)
+                    ch_bounds = font.render_to(surf, (x, y), ch)
+                    # привести rect к глобальным координатам поверхности
                     ch_bounds.x = x + ch_bounds.x
                     ch_bounds.y = y - ch_bounds.y
                     x += ch_bounds.width
-                    bbs.append(np.array(ch_bounds))
+                    bbs.append(np.array([ch_bounds.x, ch_bounds.y, ch_bounds.w, ch_bounds.h], dtype=np.int32))
 
-        # get the union of characters for cropping:
-        r0 = pygame.Rect(bbs[0])
-        rect_union = r0.unionall(bbs)
+        # если ничего не нарисовалось
+        if len(bbs) == 0:
+            alpha = pygame.surfarray.pixels_alpha(surf).swapaxes(0, 1).copy()
+            return alpha, ' '.join(str(text).split()), np.zeros((0, 4), dtype=np.int32)
 
-        # get the words:
-        words = ' '.join(text.split())
+        # union rect по bbox'ам
+        x0 = int(min(bb[0] for bb in bbs))
+        y0 = int(min(bb[1] for bb in bbs))
+        x1 = int(max(bb[0] + bb[2] for bb in bbs))
+        y1 = int(max(bb[1] + bb[3] for bb in bbs))
+        rect_union = (x0, y0, x1 - x0, y1 - y0)
 
-        # crop the surface to fit the text:
-        bbs = np.array(bbs)
-        surf_arr, bbs = crop_safe(pygame.surfarray.pixels_alpha(surf), rect_union, bbs, pad=15)
-        surf_arr = surf_arr.swapaxes(0,1)
-        #self.visualize_bb(surf_arr,bbs)
-        return surf_arr, words, bbs
+        words = ' '.join(str(text).split())
+
+        # IMPORTANT: сразу приводим к (H,W)
+        alpha = pygame.surfarray.pixels_alpha(surf).swapaxes(0, 1).copy()
+
+        # кроп по rect_union + pad
+        bbs_np = np.asarray(bbs, dtype=np.int32)
+        alpha_c, bbs_c = crop_safe(alpha, rect_union, bbs_np, pad=15)
+
+        return alpha_c, words, bbs_c
+
     
     def render_sample(self, font, mask):
         """
@@ -254,9 +332,8 @@ class RenderFont(object):
 
         return None  # Если не удалось разместить текст
 
+# --- ВНУТРИ class RenderFont(object): ---
 
-    
-    # Внутри class RenderFont:
     def get_glyph_advance(self, font, ch):
         """
         Возвращает горизонтальный advance для символа ch в пикселях.
@@ -268,6 +345,7 @@ class RenderFont(object):
                 return int(round(max(0.0, pil_font.getlength(ch))))
         except Exception:
             pass
+
         try:
             pil_font = getattr(font, "pil_font", None)
             if pil_font is not None and hasattr(pil_font, "getsize"):
@@ -275,129 +353,157 @@ class RenderFont(object):
                 return int(w)
         except Exception:
             pass
+
         # Фолбэк: оценка по аспекту и размеру
-        ar = max(0.4, float(self.font_state.get_aspect_ratio(font)))
+        try:
+            ar = float(self.font_state.get_aspect_ratio(font))
+        except Exception:
+            ar = 1.0
+        ar = max(0.4, ar)
         return max(1, int(round(ar * float(getattr(font, "size", 16)))))
 
-
+    # --- ВНУТРИ class RenderFont(object): ---
 
     def render_curved(self, font, text,
-                  char_gap_px=0, word_gap_px=8,
-                  line_gap_px=None, fp_pad_px=12):
+                    char_gap_px=None, word_gap_px=None,
+                    line_gap_px=None, fp_pad_px=12):
         """
-        Рендерит строку(строки) на фронтопараллельной канве.
+        Рендерит строку(строки) на фронтопараллельной канве (PIL).
         Возвращает:
-            txt_arr       : HxW uint8, 0 фон, 255 текст
-            txt_str       : строка с \\n между линиями
-            bb_char_xywh  : (N, 4) int32, [x, y, w, h] для каждого символа
+            txt_arr       : (H,W) uint8, 0 фон, 255 текст
+            txt_str       : строка с \\n
+            bb_char_xywh  : (N,4) int32 [x,y,w,h] по каждому символу
+
+        ВАЖНО:
+        - Нет эрозии.
+        - Нет "жирности" по умолчанию (stroke_px=0).
+        - Гарантия: advance >= ширина глифа + 1 (буквы не налезают).
+        - "Ширина текста" регулируется char_gap_rel / char_gap_px, а при желании ещё text_widen_scale.
         """
         import numpy as np
+        import cv2
         from PIL import Image, ImageDraw, ImageFont
 
-        # 0) Автоматический подбор line_gap_px
+        if char_gap_px is None:
+            char_gap_px = int(getattr(self, "char_gap_px", 0))
+        if word_gap_px is None:
+            word_gap_px = int(getattr(self, "word_gap_px", 8))
         if line_gap_px is None:
             line_gap_px = 4
 
-        # 0) Линии источника
+        # линии
         if isinstance(text, list):
             lines = [str(ln) for ln in text]
         else:
             lines = str(text).split("\n")
 
-        # 1) Подготовим PIL-шрифт
+        # PIL font
         pil_font = getattr(font, "pil_font", None)
         if pil_font is None:
-            pil_font = ImageFont.truetype(
-                getattr(font, "path"),
-                size=getattr(font, "size", 16)
-            )
+            pil_font = ImageFont.truetype(getattr(font, "path"), size=int(getattr(font, "size", 16)))
 
-        base_size = getattr(font, "size", 16)
-        ascent, descent = pil_font.getmetrics()
+        base_size = int(getattr(font, "size", 16))
+
+        # метрики строки
+        try:
+            ascent, descent = pil_font.getmetrics()
+        except Exception:
+            ascent, descent = base_size, int(0.25 * base_size)
+
         line_extra = int(0.25 * base_size)
         safe_line_h = int(ascent + descent + line_extra)
 
-        # 2) Разбор по строкам
-        per_line_chars   = []
+        # разбор строк: символы + флаг "начало слова"
+        per_line_chars = []
         per_line_wbflags = []
         for ln in lines:
-            chars, flags = [], []
+            ln = str(ln)
+            chars, wb = [], []
             prev_space = True
             for ch in ln:
                 if ch.isspace():
                     prev_space = True
                     continue
                 chars.append(ch)
-                flags.append(prev_space)
+                wb.append(bool(prev_space))
                 prev_space = False
             per_line_chars.append(chars)
-            per_line_wbflags.append(flags)
+            per_line_wbflags.append(wb)
 
-        # 3) Метрики по строкам
-        line_advances      = []
-        line_glyph_bboxes  = []
-        line_widths        = []
-        line_heights       = []
+        # относительный трекинг
+        char_gap_rel = float(getattr(self, "char_gap_rel", 0.0))
+        char_gap_rel = float(np.clip(char_gap_rel, -0.10, 0.35))
 
-        char_gap_rel = getattr(self, "char_gap_rel", -0.15)
+        # собираем advances и bbox-ы глифов
+        line_advances = []
+        line_glyph_bboxes = []
+        line_widths = []
+        line_heights = []
 
         for chars, wbflags in zip(per_line_chars, per_line_wbflags):
             advances = []
             glyph_bboxes = []
 
             for ch in chars:
-                # bbox глифа
                 try:
                     l, t, r, b = pil_font.getbbox(ch)
                 except Exception:
                     mask = pil_font.getmask(ch, mode="L")
-                    if hasattr(mask, "size"):
-                        w, h = mask.size
-                    else:
-                        w, h = base_size, base_size
-                    l, t, r, b = 0, 0, w, h
+                    w, h = (mask.size if hasattr(mask, "size") else (base_size, base_size))
+                    l, t, r, b = 0, 0, int(w), int(h)
 
-                glyph_bboxes.append((int(l), int(t), int(r), int(b)))
+                l, t, r, b = int(l), int(t), int(r), int(b)
+                gw = max(1, int(r - l))
+                glyph_bboxes.append((l, t, r, b))
 
-                # advance
+                # базовый advance
                 try:
                     adv_base = float(self.get_glyph_advance(font, ch))
                 except Exception:
-                    adv_base = float(r - l) if (r > l) else float(base_size)
+                    adv_base = float(gw)
 
-                adv = adv_base * (1.0 + char_gap_rel)
-                adv += float(char_gap_px)
+                adv = adv_base * (1.0 + char_gap_rel) + float(char_gap_px)
+
+                # ✅ КРИТИЧНО: не даём следующей букве налезть на текущую
+                adv = max(adv, float(gw + 1))
+
                 adv = max(1, int(round(adv)))
                 advances.append(adv)
 
+            # ширина строки с учётом word_gap_px
             if glyph_bboxes:
-                min_left  = min(bb[0] for bb in glyph_bboxes)
-                max_right = max(bb[2] for bb in glyph_bboxes)
+                min_left = min(bb[0] for bb in glyph_bboxes)
                 left_comp = max(0, -min_left)
-                line_w = int(sum(advances) + left_comp)
+
+                wsum = int(left_comp)
+                for j, adv in enumerate(advances):
+                    if j > 0 and wbflags[j]:
+                        wsum += int(word_gap_px)
+                    wsum += int(adv)
+                line_w = int(wsum)
             else:
                 line_w = 0
-
-            line_h = safe_line_h
 
             line_advances.append(advances)
             line_glyph_bboxes.append(glyph_bboxes)
             line_widths.append(line_w)
-            line_heights.append(line_h)
+            line_heights.append(int(safe_line_h))
 
-        # 4) Общий размер канвы
-        total_w = max(1, (max(line_widths) if len(line_widths) else 1)) + 2 * int(fp_pad_px)
+        # канва
+        max_line_w = max(line_widths) if line_widths else 1
+        total_w = max(1, int(max_line_w) + 2 * int(fp_pad_px))
+
         total_h = 2 * int(fp_pad_px)
         for i, lh in enumerate(line_heights):
-            total_h += lh
+            total_h += int(lh)
             if i + 1 < len(line_heights):
                 total_h += int(line_gap_px)
-        total_h = max(1, total_h)
+        total_h = max(1, int(total_h))
 
         canvas = Image.new("L", (total_w, total_h), 0)
-        draw   = ImageDraw.Draw(canvas)
+        draw = ImageDraw.Draw(canvas)
 
-        # 5) Рендер и сбор bb_char_xywh
+        # рендер + bbox
         bb_list = []
         y_cursor = int(fp_pad_px)
 
@@ -405,91 +511,95 @@ class RenderFont(object):
             zip(per_line_chars, per_line_wbflags, line_advances, line_glyph_bboxes)
         ):
             x_cursor = int(fp_pad_px)
+            line_h = int(line_heights[line_idx])
 
             if glyph_bboxes:
-                min_left  = min(bb[0] for bb in glyph_bboxes)
-                min_top   = min(bb[1] for bb in glyph_bboxes)
+                min_left = min(bb[0] for bb in glyph_bboxes)
+                min_top  = min(bb[1] for bb in glyph_bboxes)
             else:
                 min_left, min_top = 0, 0
 
-            base_x_shift = max(0, -min_left)
-            base_y_shift = max(0, -min_top)
+            base_x_shift = max(0, -int(min_left))
+            base_y_shift = max(0, -int(min_top))
 
-            line_h = line_heights[line_idx]
+            for j, (ch, adv, (l, t, r, b)) in enumerate(zip(chars, advances, glyph_bboxes)):
+                if j > 0 and wbflags[j]:
+                    x_cursor += int(word_gap_px)
 
-            for (ch, adv, (l, t, r, b)) in zip(chars, advances, glyph_bboxes):
-                gw, gh = (r - l), (b - t)
+                gw = max(1, int(r - l))
 
-                draw_x = x_cursor + (l + base_x_shift)
-                draw_y = y_cursor + base_y_shift
+                # хотим, чтобы bbox глифа начинался в (x_cursor + base_x_shift)
+                glyph_x0 = int(x_cursor + base_x_shift)
+                glyph_y0 = int(y_cursor + base_y_shift)
 
-                # один раз рисуем глиф
+                # позиция рисования (компенсируем l,t)
+                draw_x = int(glyph_x0 - l)
+                draw_y = int(glyph_y0 - t)
+
                 draw.text((draw_x, draw_y), ch, fill=255, font=pil_font)
 
-                bb_list.append([int(draw_x), int(y_cursor), int(gw), int(line_h)])
+                # bbox на всю высоту строки (как у тебя было), ширина = ширина глифа
+                bb_list.append([int(glyph_x0), int(y_cursor), int(gw), int(max(1, line_h))])
 
-                x_cursor += adv
+                x_cursor += int(adv)
 
-            y_cursor += line_h
+            y_cursor += int(line_h)
             if line_idx + 1 < len(line_heights):
                 y_cursor += int(line_gap_px)
 
+        # numpy
         txt_arr = np.array(canvas, dtype=np.uint8)
 
-        # 6) Чуть поправим верх/низ (как было)
+        # бинаризация: лучше OTSU (антиалиас не превращается в "толстый" контур)
         if txt_arr.size:
-            nonzero_rows = np.where(np.any(txt_arr > 0, axis=1))[0]
-            if nonzero_rows.size:
-                top    = int(nonzero_rows[0])
-                bottom = int(nonzero_rows[-1])
-                H      = txt_arr.shape[0]
+            _, txt_bin = cv2.threshold(txt_arr, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        else:
+            txt_bin = txt_arr
 
-                margin_target = max(4, int(0.15 * base_size))
+        # --- опциональная "жирность", но БЕЗ эрозии ---
+        stroke = int(getattr(self, "stroke_px", 0))
+        stroke_mode = str(getattr(self, "stroke_mode", "edge")).lower()
 
-                curr_top_margin    = top
-                curr_bottom_margin = H - 1 - bottom
+        # по умолчанию для больших размеров отключаем stroke (читаемость важнее)
+        if base_size >= 26:
+            stroke = 0
 
-                pad_top    = max(0, margin_target - curr_top_margin)
-                pad_bottom = max(0, margin_target - curr_bottom_margin)
+        if stroke > 0 and txt_bin.size and stroke_mode != "none":
+            k = 2 * stroke + 1
+            kern = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
 
-                if pad_top > 0 or pad_bottom > 0:
-                    txt_arr = np.pad(
-                        txt_arr,
-                        ((pad_top, pad_bottom), (0, 0)),
-                        mode="constant"
-                    )
-                    for i in range(len(bb_list)):
-                        bb_list[i][1] += pad_top
+            if stroke_mode == "dilate":
+                # агрессивно — может склеивать дырки
+                txt_bin = cv2.dilate(txt_bin, kern, iterations=1)
+            else:
+                # ✅ бережный режим: утолщаем границы, дырки живут лучше
+                edge = cv2.morphologyEx(txt_bin, cv2.MORPH_GRADIENT, kern)
+                edge = cv2.dilate(edge, kern, iterations=1)
+                txt_bin = cv2.bitwise_or(txt_bin, edge)
 
-        # 7) Жёсткая бинаризация + более жирный штрих + «ореол» без прозрачности
-        if txt_arr.size:
-            import cv2
+        # --- "ширина текста" (горизонтальное растяжение) ---
+        widen = float(getattr(self, "text_widen_scale", 1.0))
+        if widen is None:
+            widen = 1.0
+        widen = float(np.clip(widen, 0.7, 1.6))
 
-            # 7.1. Убираем полутон: только 0 или 255
-            _, txt_bin = cv2.threshold(txt_arr, 0, 255, cv2.THRESH_BINARY)
+        if txt_bin.size and abs(widen - 1.0) > 1e-3:
+            H, W = txt_bin.shape[:2]
+            newW = max(1, int(round(W * widen)))
+            txt_bin = cv2.resize(txt_bin, (newW, H), interpolation=cv2.INTER_NEAREST)
 
-            # 7.2. Основное «жирное» ядро текста (2 итерации дилатации)
-            core_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-            txt_core = cv2.dilate(txt_bin, core_kernel, iterations=2)
-
-            # 7.3. Дополнительный "ореол" вокруг текста
-            glow_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-            txt_glow = cv2.dilate(txt_bin, glow_kernel, iterations=1)
-            _, txt_glow = cv2.threshold(txt_glow, 0, 255, cv2.THRESH_BINARY)
-
-            # 7.4. Итоговая маска: ядро + ореол, всё бинарно
-            txt_arr = np.maximum(txt_core, txt_glow)
+            # поправим bbox-ы по X
+            for i in range(len(bb_list)):
+                bb_list[i][0] = int(round(bb_list[i][0] * widen))
+                bb_list[i][2] = max(1, int(round(bb_list[i][2] * widen)))
 
         txt_str = "\n".join(lines)
         bb_char_xywh = (
             np.array(bb_list, dtype=np.int32)
-            if len(bb_list)
-            else np.zeros((0, 4), dtype=np.int32)
+            if len(bb_list) else np.zeros((0, 4), dtype=np.int32)
         )
 
-        return txt_arr, txt_str, bb_char_xywh
-
-
+        return txt_bin, txt_str, bb_char_xywh
 
     def get_nline_nchar(self, mask_size, font_height, font_width):
         """
@@ -736,19 +846,28 @@ class FontState(object):
         return m[0]*font_size_px + m[1] #linear model
 
 
+
     def sample(self):
         """
-        Samples from the font state distribution
+        Samples from the font state distribution.
+        Подчёркивание (underline) отключено полностью.
         """
+        # underline_adjustment: нормальный clamp в [-2, 2]
+        ua = self.underline_adjustment[1] * np.random.randn() + self.underline_adjustment[0]
+        ua = float(np.clip(ua, -2.0, 2.0))
+
         return {
             'font': self.fonts[int(np.random.randint(0, len(self.fonts)))],
-            'size': self.size[1]*np.random.randn() + self.size[0],
-            'underline': np.random.rand() < self.underline,
-            'underline_adjustment': max(2.0, min(-2.0, self.underline_adjustment[1]*np.random.randn() + self.underline_adjustment[0])),
+            'size': self.size[1] * np.random.randn() + self.size[0],
+
+            # ✅ underline выключен навсегда:
+            'underline': False,
+            'underline_adjustment': ua,
+
             'strong': np.random.rand() < self.strong,
             'oblique': np.random.rand() < self.oblique,
-            'strength': (self.strength[1] - self.strength[0])*np.random.rand() + self.strength[0],
-            'char_spacing': int(self.kerning[3]*(np.random.beta(self.kerning[0], self.kerning[1])) + self.kerning[2]),
+            'strength': (self.strength[1] - self.strength[0]) * np.random.rand() + self.strength[0],
+            'char_spacing': int(self.kerning[3] * (np.random.beta(self.kerning[0], self.kerning[1])) + self.kerning[2]),
             'border': np.random.rand() < self.border,
             'random_caps': np.random.rand() < self.random_caps,
             'capsmode': random.choice(self.capsmode),
@@ -757,18 +876,23 @@ class FontState(object):
             'random_kerning_amount': self.random_kerning_amount,
         }
 
-    def init_font(self,fs):
+    def init_font(self, fs):
         """
         Initializes a pygame font.
-        FS : font-state sample
+        Подчёркивание (underline) отключено полностью, даже если где-то ещё fs содержит underline=True.
         """
         font = freetype.Font(fs['font'], size=fs['size'])
-        font.underline = fs['underline']
-        font.underline_adjustment = fs['underline_adjustment']
+
+        # ✅ жёстко выключаем underline:
+        font.underline = False
+        # underline_adjustment оставим, но он ни на что не повлияет при underline=False
+        font.underline_adjustment = fs.get('underline_adjustment', 0.0)
+
         font.strong = fs['strong']
         font.oblique = fs['oblique']
         font.strength = fs['strength']
-        char_spacing = fs['char_spacing']
+
+        # остальное как было
         font.antialiased = False
         font.origin = True
         return font

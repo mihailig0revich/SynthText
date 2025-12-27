@@ -436,3 +436,205 @@ def apply_random_augmentations(
 
     return out_img
 
+def apply_noise_recipe(
+    img: np.ndarray,
+    *,
+    cfg: dict | None = None,
+    # шанс полностью пропустить аугментации (НЕ масштабируем p_boost)
+    p_none: float = 0.12,
+    # общий множитель вероятностей (насколько чаще)
+    p_boost: float = 1.0,
+    # общий множитель “силы” (насколько сильнее)
+    strength: float = 1.0,
+    # если True — гарантируем хотя бы 1 операцию (fallback). Для “иногда вообще без ауг” ставь False
+    force_at_least_one: bool = False,
+):
+    """
+    Возвращает (img_out, applied_ops:list[str])
+
+    ВАЖНО:
+    - p_none_eff не умножаем на p_boost, иначе усиление “убьёт” шанс полного отсутствия.
+    - Если force_at_least_one=False и ничего не сработало по рандому — вернёт ["none_by_draw"].
+
+    ИЗМЕНЕНО В ЭТОЙ ВЕРСИИ:
+    - Ослаблены ИМЕННО шумы: gaussian / speckle / salt&pepper
+    - Цветовые изменения и размытие (motion blur) не трогал.
+    """
+    import numpy as np
+
+    if cfg is None:
+        cfg = {}
+
+    rnd = np.random.rand
+
+    def _clamp01(x: float) -> float:
+        return float(max(0.0, min(1.0, x)))
+
+    # --- параметры из cfg (если заданы) ---
+    debug = bool(cfg.get("debug", False))
+
+    p_none_eff = float(cfg.get("p_none", p_none))
+    p_boost_eff = float(cfg.get("p_boost", p_boost))
+    strength_eff = float(cfg.get("strength", strength))
+    force_one = bool(cfg.get("force_at_least_one", force_at_least_one))
+
+    p_none_eff = _clamp01(p_none_eff)
+    p_boost_eff = max(0.0, p_boost_eff)
+    strength_eff = max(0.0, strength_eff)
+
+    # ✅ шанс полностью пропустить ВСЁ
+    if rnd() < p_none_eff:
+        if debug:
+            print(f"[NOISE] none gate: p_none={p_none_eff:.3f} -> SKIP ALL")
+        return img, ["none"]
+
+    def P(key: str, base: float) -> float:
+        """Берём вероятность из cfg (если есть), иначе base; потом множим на p_boost."""
+        p = float(cfg.get(key, base))
+        return _clamp01(p * p_boost_eff)
+
+    def U(a: float, b: float) -> float:
+        return float(np.random.uniform(a, b))
+
+    applied: list[str] = []
+    out = img
+
+    # ------------------------------------------------------------
+    # 1) ОСВЕЩЕНИЕ / КОНТРАСТ
+    # ------------------------------------------------------------
+    # (a) контраст “время суток”
+    if P("p_contrast", 0.85) > 0 and rnd() < P("p_contrast", 0.85):
+        try:
+            out = adjust_contrast_time_of_day(out)
+            applied.append("contrast_time_of_day")
+        except Exception:
+            pass
+
+    # (b) глобальное затемнение/гамма (освещение)
+    if P("p_darken", 0.70) > 0 and rnd() < P("p_darken", 0.70):
+        try:
+            lo = max(0.55, 0.80 - 0.18 * (strength_eff - 1.0))
+            hi = 1.00
+            g0 = 0.85
+            g1 = 1.25 + 0.25 * max(0.0, strength_eff - 1.0)
+
+            out = darken_scene_realistic(
+                out,
+                strength_range=(lo, hi),
+                gamma_range=(g0, g1),
+                vignette_p=0.55,
+            )
+            applied.append("darken_scene")
+        except Exception:
+            pass
+
+    # ------------------------------------------------------------
+    # 2) “ПЛОХАЯ КАМЕРА”
+    # ------------------------------------------------------------
+    # ✅ Гаусс — ОСЛАБЛЕНО (только шум)
+    if rnd() < P("p_gauss", 0.90):
+        try:
+            # было: U(0.030, 0.070) * (0.85 + 0.35*strength)
+            sigma = U(0.018, 0.045) * (0.80 + 0.25 * strength_eff)
+            sigma = float(np.clip(sigma, 0.006, 0.080))
+            out = noise_gaussian(out, sigma=sigma)
+            applied.append("gauss")
+        except Exception:
+            pass
+
+    # ✅ Speckle — ОСЛАБЛЕНО (только шум)
+    if rnd() < P("p_speckle", 0.88):
+        try:
+            # было: U(0.040, 0.095) * (0.85 + 0.35*strength)
+            sigma = U(0.020, 0.055) * (0.80 + 0.25 * strength_eff)
+            sigma = float(np.clip(sigma, 0.006, 0.110))
+            out = noise_speckle(out, sigma=sigma)
+            applied.append("speckle")
+        except Exception:
+            pass
+
+    # ✅ Salt&pepper — ОСЛАБЛЕНО СИЛЬНО (только шум)
+    if rnd() < P("p_sap", 0.55):
+        try:
+            # было: U(0.020, 0.090) * (0.90 + 0.40*strength)
+            amt = U(0.004, 0.035) * (0.85 + 0.20 * strength_eff)
+            amt = float(np.clip(amt, 0.001, 0.090))
+            out = noise_saltpepper(out, amount=amt, s_vs_p=0.5)
+            applied.append("saltpepper")
+        except Exception:
+            pass
+
+    # Motion blur — НЕ ТРОГАЛ (ты просил не ослаблять размытие)
+    if rnd() < P("p_motion", 0.40):
+        try:
+            kmax = int(np.clip(round(8 + 6 * max(0.0, strength_eff - 1.0)), 8, 17))
+            k = int(np.random.randint(3, kmax + 1))
+            ang = U(-35, 35) * (0.85 + 0.45 * strength_eff)
+            out = motion_blur(out, k=k, angle_deg=ang)
+            applied.append(f"motion(k={k})")
+        except Exception:
+            pass
+
+    # Vignette — не трогал (это не “шум”)
+    if rnd() < P("p_vignette", 0.55):
+        try:
+            v = U(0.10, 0.32) * (0.90 + 0.35 * strength_eff)
+            v = float(np.clip(v, 0.05, 0.50))
+            out = vignette(out, strength=v)
+            applied.append("vignette")
+        except Exception:
+            pass
+
+    # Color jitter — НЕ ТРОГАЛ (ты просил не ослаблять изменение цвета)
+    if rnd() < P("p_color", 0.85):
+        try:
+            hue = U(6, 14) * (0.85 + 0.35 * strength_eff)
+            sat = U(0.07, 0.18) * (0.85 + 0.35 * strength_eff)
+            val = U(0.07, 0.18) * (0.85 + 0.35 * strength_eff)
+            out = color_jitter_rgb(out, hue=hue, sat=sat, val=val)
+            applied.append("color_jitter")
+        except Exception:
+            pass
+
+    # JPEG — не трогал (оставил как было)
+    if rnd() < P("p_jpeg", 0.90):
+        try:
+            q_hi = 90
+            q_lo = int(np.clip(round(55 - 15 * max(0.0, strength_eff - 1.0)), 25, 70))
+            q = int(np.random.randint(q_lo, q_hi))
+            out = jpeg_compress_rgb(out, quality=q)
+            applied.append(f"jpeg(q={q})")
+        except Exception:
+            pass
+
+    # ------------------------------------------------------------
+    # 3) локальные аугментации (если хочешь)
+    # ------------------------------------------------------------
+    if rnd() < P("p_local", 0.35):
+        try:
+            local_cfg = cfg.get("local_cfg", None)
+            try:
+                out = apply_random_augmentations(out, masks=None, cfg=local_cfg)
+            except TypeError:
+                out = apply_random_augmentations(out)
+            applied.append("local_aug")
+        except Exception:
+            pass
+
+    # ------------------------------------------------------------
+    # Итог: если ничего не применили
+    # ------------------------------------------------------------
+    if not applied:
+        if force_one:
+            try:
+                out = color_jitter_rgb(out, hue=1.0, sat=0.02, val=0.02)
+                applied = ["fallback_color"]
+            except Exception:
+                applied = ["none_by_draw"]
+        else:
+            applied = ["none_by_draw"]
+
+    if debug:
+        print("[NOISE] applied:", applied)
+
+    return out, applied
