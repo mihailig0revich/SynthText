@@ -112,7 +112,7 @@ def _open_out_h5_locked(path: str):
         raise
 
 
-def _open_out_h5_next_free(base_path: str, start_index: int = 0):
+def _open_out_h5_next_free(base_path: str, run_id: str, start_index: int = 0):
     """
     Находит "следующий свободный" output-файл БЕЗ гонки:
     - для каждого кандидата пытается atomically взять lock;
@@ -121,7 +121,7 @@ def _open_out_h5_next_free(base_path: str, start_index: int = 0):
     """
     idx = int(start_index)
     while True:
-        path = _make_out_path_with_index(base_path, idx)
+        path = _make_out_path_with_index(base_path, run_id, idx)
         os.makedirs(osp.dirname(path), exist_ok=True)
 
         lock_path = _acquire_lock_or_none(path)
@@ -187,6 +187,16 @@ def get_data(h5_path=None):
     print("[H5] top-level keys:", list(db.keys()))
     return db
 
+import os, time, uuid, re
+
+def make_run_id():
+    # безопасно для Windows/macOS/Linux (только цифры/буквы/подчёркивания)
+    ts = time.strftime("%Y%m%d_%H%M%S")
+    pid = os.getpid()
+    rnd = uuid.uuid4().hex[:6]
+    rid = f"{ts}_{pid}_{rnd}"
+    rid = re.sub(r"[^0-9A-Za-z_]+", "_", rid)
+    return rid
 
 
 def clean_depth_and_seg(depth, seg):
@@ -223,20 +233,21 @@ def pick_group(db, candidates):
 
 
 def add_res_to_db(imgname, res, db):
-    """
-    Сохраняет синтетические результаты в выходной H5 в формате
-    совместимом с оригинальным SynthText:
+    dt = h5py.string_dtype(encoding="utf-8")  # UTF-8 строки
 
-    /data/<imgname>_i  (dataset с изображением)
-        attrs['charBB'], attrs['wordBB'], attrs['txt']
-    """
     for i, r in enumerate(res):
         dname = f"{imgname}_{i}"
-        dset = db['data'].create_dataset(dname, data=r['img'])
-        dset.attrs['charBB'] = r['charBB']
-        dset.attrs['wordBB'] = r['wordBB']
-        L = [t.encode("ascii", "ignore") for t in r['txt']]
-        dset.attrs['txt'] = L
+        dset = db["data"].create_dataset(dname, data=r["img"])
+
+        dset.attrs["charBB"] = r["charBB"]
+        dset.attrs["wordBB"] = r["wordBB"]
+
+        txt_list = [str(t) for t in r.get("txt", [])]
+        dset.attrs.create("txt", np.array(txt_list, dtype=dt))
+
+        lang_list = [str(x) for x in r.get("lang", [])]
+        if lang_list:
+            dset.attrs.create("lang", np.array(lang_list, dtype=dt))
 
 
 def _read_depth_to_hw_float(depth_item):
@@ -286,26 +297,24 @@ def _assert_render_assets(path):
 
 # ================== NEW: работа с выходными H5-файлами ==================
 
-def _make_out_path_with_index(base_path: str, index: int) -> str:
+def _make_out_path_with_index(base_path: str, run_id: str, index: int) -> str:
     """
     base_path = 'results/SynthText.h5'
-    index = 0   -> 'results/SynthText.h5'
-    index = 1   -> 'results/SynthText_0001.h5'
-    index = 2   -> 'results/SynthText_0002.h5'
-    и т.д.
+    run_id    = '20251229_201530_12345_ab12cd'
+    index     = 0 -> 'results/SynthText_<run_id>_0000.h5'
+    index     = 1 -> 'results/SynthText_<run_id>_0001.h5'
     """
-    if index == 0:
-        return base_path
     root, ext = osp.splitext(base_path)
-    return f"{root}_{index:04d}{ext}"
+    return f"{root}_{run_id}_{int(index):04d}{ext}"
 
 
-def _open_out_h5(base_path: str, index: int):
+
+def _open_out_h5(base_path: str, run_id: str, index: int):
     """
     Открывает новый выходной H5-файл и создаёт группу /data.
     Возвращает (h5_file, path).
     """
-    path = _make_out_path_with_index(base_path, index)
+    path = _make_out_path_with_index(base_path, run_id, index)
     os.makedirs(osp.dirname(path), exist_ok=True)
     f = h5py.File(path, 'w')
     f.create_group('/data')
@@ -313,10 +322,11 @@ def _open_out_h5(base_path: str, index: int):
     return f, path
 
 
-def _maybe_roll_output_h5(out_db, out_path, out_lock_path, base_path, index, max_gb: float):
+
+def _maybe_roll_output_h5(out_db, out_path, out_lock_path, base_path, run_id, index, max_gb: float):
     """
     Проверяет размер текущего H5-файла.
-    Если размер >= max_gb, закрывает его, освобождает lock и открывает новый (без гонки).
+    Если размер >= max_gb, закрывает его, освобождает lock и открывает новый.
     Возвращает (out_db, out_path, new_index, out_lock_path).
     """
     try:
@@ -338,13 +348,11 @@ def _maybe_roll_output_h5(out_db, out_path, out_lock_path, base_path, index, max
         _release_lock(out_lock_path)
 
         # открываем следующий свободный (начиная с index+1)
-        out_db, out_path, new_index, out_lock_path = _open_out_h5_next_free(base_path, index + 1)
+        out_db, out_path, new_index, out_lock_path = _open_out_h5_next_free(base_path, run_id, index + 1)
         return out_db, out_path, new_index, out_lock_path
 
     return out_db, out_path, index, out_lock_path
 
-
-# =======================================================================
 
 
 def main(viz=False):
@@ -378,6 +386,19 @@ def main(viz=False):
     os.makedirs(osp.dirname(OUT_FILE), exist_ok=True)
     os.makedirs(PNG_DIR, exist_ok=True)
 
+    # ✅ RUN_ID один на запуск (для имён выходных файлов)
+    try:
+        RUN_ID = make_run_id()
+    except Exception:
+        # Важно: НЕ импортируем os тут, иначе он станет локальным и сломает os.makedirs выше
+        import time, uuid, re
+        ts = time.strftime("%Y%m%d_%H%M%S")
+        pid = os.getpid()  # используем глобальный os
+        rnd = uuid.uuid4().hex[:6]
+        RUN_ID = re.sub(r"[^0-9A-Za-z_]+", "_", f"{ts}_{pid}_{rnd}")
+
+    print(colorize(Color.BLUE, f"[RUN] id = {RUN_ID}", bold=True))
+
     # --- выбор/открытие выходного H5 с lock (защита от двух консолей) ---
     out_db = None
     out_path = None
@@ -391,8 +412,9 @@ def main(viz=False):
         out_db, out_path, out_lock_path = _open_out_h5_locked(out_path)
         out_index = 0
     else:
-        # Боевой режим: следующий свободный индекс БЕЗ гонки (через lock)
-        out_db, out_path, out_index, out_lock_path = _open_out_h5_next_free(OUT_FILE, 0)
+        # Боевой режим: следующий свободный индекс БЕЗ гонки (через lock),
+        # и имя включает RUN_ID
+        out_db, out_path, out_index, out_lock_path = _open_out_h5_next_free(OUT_FILE, RUN_ID, 0)
 
     try:
         # Рендерер один на все входные файлы
@@ -482,13 +504,14 @@ def main(viz=False):
                             saved_any = True
 
                             # если мы не в viz-режиме — проверяем размер и при необходимости
-                            # переключаемся на НОВЫЙ файл с увеличенным индексом (и новым lock)
+                            # переключаемся на НОВЫЙ файл с увеличенным индексом (и тем же RUN_ID)
                             if not viz:
                                 out_db, out_path, out_index, out_lock_path = _maybe_roll_output_h5(
                                     out_db,
                                     out_path,
                                     out_lock_path,
                                     OUT_FILE,
+                                    RUN_ID,
                                     out_index,
                                     max_gb=MAX_H5_SIZE_GB,
                                 )
@@ -531,11 +554,6 @@ def main(viz=False):
                 out_db.close()
         finally:
             _release_lock(out_lock_path)
-
-
-
-
-
 
 
 if __name__ == '__main__':

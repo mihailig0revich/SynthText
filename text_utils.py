@@ -173,7 +173,10 @@ class RenderFont(object):
         Also, outputs ground-truth bounding boxes and text string
     """
 
-    def __init__(self, data_dir='data'):
+    def __init__(self, data_dir='data',
+                 corpus_en=None,
+                 corpus_ru=None,
+                 p_lang=None):
         # distribution over the type of text:
         self.p_text = {
             'WORD': 1.0,
@@ -183,32 +186,60 @@ class RenderFont(object):
 
         ## TEXT PLACEMENT PARAMETERS:
         self.f_shrink = 0.90
-        self.max_shrink_trials = 5
+        self.max_shrink_trials = 5  
         self.min_nchar = 2
         self.min_font_h = 16
         self.max_font_h = 500
         self.p_flat = 0.0
 
-        # пробел между словами (оставим как было)
         self.word_gap_px = 8
-        self.char_gap_rel = 0.08    # чуть больше расстояние между буквами
-        self.char_gap_px = 0        # можно 0..1
-        self.text_widen_scale = 1.0 # не растягивать
+        self.char_gap_rel = 0.08
+        self.char_gap_px = 0
+        self.text_widen_scale = 1.0
 
-        # --- жирность / морфология ---
-        # По умолчанию = 0 (никакой "жирности" — чтобы буквы не склеивались)
         self.stroke_px = 1
-        self.stroke_mode = "edge"   # важно: edge, не dilate
+        self.stroke_mode = "edge"
 
-        # curved baseline:
         self.p_curved = 0
         self.baselinestate = 0.05
 
-        # text-source : gets english text:
-        self.text_source = TextSource(
-            min_nchar=self.min_nchar,
-            fn=osp.join(data_dir, 'newsgroup/newsgroup.txt')
-        )
+        # --------- NEW: два корпуса ----------
+        if corpus_en is None:
+            corpus_en = osp.join(data_dir, 'newsgroup', 'newsgroup_en.txt')
+        if corpus_ru is None:
+            corpus_ru = osp.join(data_dir, 'newsgroup', 'newsgroup_ru.txt')
+
+        # fallback на старый путь, если новых файлов нет
+        legacy = osp.join(data_dir, 'newsgroup', 'newsgroup.txt')
+
+        has_en = osp.exists(corpus_en)
+        has_ru = osp.exists(corpus_ru)
+
+        if not has_en and not has_ru:
+            # старое поведение
+            corpus_en = legacy
+            has_en = osp.exists(corpus_en)
+
+        sources = {}
+        if has_en:
+            sources["en"] = TextSource(min_nchar=self.min_nchar, fn=corpus_en)
+        if has_ru:
+            sources["ru"] = TextSource(min_nchar=self.min_nchar, fn=corpus_ru)
+
+        if not sources:
+            raise FileNotFoundError(
+                f"Не найден ни один корпус текста:\n"
+                f"  en: {corpus_en}\n"
+                f"  ru: {corpus_ru}\n"
+                f"  legacy: {legacy}"
+            )
+
+        if p_lang is None:
+            # дефолт: равновероятно по имеющимся
+            p_lang = {k: 1.0 for k in sources.keys()}
+
+        # теперь text_source — билингвальный
+        self.text_source = BilingualTextSource(sources=sources, p_lang=p_lang)
 
         # get font-state object:
         self.font_state = FontState(data_dir)
@@ -896,6 +927,51 @@ class FontState(object):
         font.antialiased = False
         font.origin = True
         return font
+
+class BilingualTextSource(object):
+    """
+    Обёртка над двумя TextSource: en + ru.
+    Совместима с старым интерфейсом sample(...), но умеет отдавать язык.
+    """
+    def __init__(self, sources: dict, p_lang=None, default_lang="en"):
+        """
+        sources: {"en": TextSource(...), "ru": TextSource(...)}
+        p_lang : {"en": 0.5, "ru": 0.5} (можно не задавать)
+        """
+        self.sources = dict(sources)
+        self.langs = list(self.sources.keys())
+
+        if not self.langs:
+            raise ValueError("BilingualTextSource: empty sources")
+
+        self.default_lang = default_lang if default_lang in self.sources else self.langs[0]
+        self.last_lang = self.default_lang
+
+        if p_lang is None:
+            p_lang = {k: 1.0 for k in self.langs}
+
+        ps = np.array([float(p_lang.get(k, 0.0)) for k in self.langs], dtype=np.float64)
+        if not np.isfinite(ps).all() or ps.sum() <= 0:
+            ps = np.ones(len(self.langs), dtype=np.float64) / float(len(self.langs))
+        else:
+            ps = ps / ps.sum()
+
+        self.p_lang = {k: float(ps[i]) for i, k in enumerate(self.langs)}
+
+    def _pick_lang(self):
+        ps = np.array([self.p_lang[k] for k in self.langs], dtype=np.float64)
+        ps = ps / ps.sum()
+        return str(np.random.choice(self.langs, p=ps))
+
+    def sample(self, nline_max, nchar_max, kind='WORD', return_lang: bool = False):
+        lang = self._pick_lang()
+        src = self.sources.get(lang) or self.sources.get(self.default_lang)
+        txt = src.sample(nline_max, nchar_max, kind=kind)
+        self.last_lang = lang
+
+        if return_lang:
+            return txt, lang
+        return txt
 
 
 class TextSource(object):

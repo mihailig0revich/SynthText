@@ -811,7 +811,7 @@ class   RendererV3(object):
         self.persp_max_tilt_deg = 45.0
 
         # --- homography / FP debug (используются) ---
-        self.debug_hgeom = True
+        self.debug_hgeom = False
         self.debug_hgeom_max_regions = 3
         self.debug_hgeom_npts = 64
         self.debug_hgeom_print_mats = False
@@ -901,7 +901,9 @@ class   RendererV3(object):
 
         self.max_text_instances = 3
 
-        self.debug = True
+        self.debug = False
+
+        self.log = False
 
         self.overlay_occ_enable = True
         self.overlay_occ_p = 1.0                    # вероятность окклюзии для данного текста
@@ -926,7 +928,7 @@ class   RendererV3(object):
 
         self.overlay_occ_kind_probs = {"band_poly": 0.25, "sticker": 0.40, "ellipse": 0.25, "edge_block": 0.10}
 
-        self.disable_all_augs = False
+        self.disable_all_augs = True
         self.noise_mode = "auto"
         self.noise_strength = 1.1   # попробуй 1.20 если хочется пожёстче
         self.noise_p_boost = 1.25
@@ -1561,16 +1563,28 @@ class   RendererV3(object):
 
 
     def select_region_for_text(self, txt, font, f_layout, f_asp, place_masks, regions,
-                gap_px=6, min_font_px=14, shrink_step=0.90, side_margin=0.90,
-                min_text_px_img=80, occupied_global=None, fast_mode=True,
-                img=None, nline=1, nchar=10, force_ireg=None, **kwargs):
+        gap_px=6, min_font_px=14, shrink_step=0.90, side_margin=0.90,
+        min_text_px_img=80, occupied_global=None, fast_mode=True,
+        img=None, nline=1, nchar=10, force_ireg=None, **kwargs):
         """
-        Быстрый выбор региона через кэш.
-
-        НОВОЕ:
-        - force_ireg: если задан, пробуем ТОЛЬКО этот регион (для "перемешали регионы и идём по списку")
+        ВАЖНОЕ ИЗМЕНЕНИЕ:
+        - Раньше регион добавлялся в self._used_regions_this_image прямо тут на "accept".
+        Это ломало повторные попытки в одном и том же force_ireg (первая попытка упала → регион уже used).
+        - Теперь used помечается ТОЛЬКО ПОСЛЕ УСПЕШНОГО overlay в place_text_textfirst().
         """
         import numpy as np
+
+        debug_txt = bool(getattr(self, "debug_txt", False))
+        debug_regions = bool(getattr(self, "debug_regions", False))
+        dbg_on = debug_txt or debug_regions
+
+        def _dbg(msg, **kw):
+            if not dbg_on:
+                return
+            s = f"[TXT] select_region_for_text: {msg}"
+            if kw:
+                s += " | " + ", ".join(f"{k}={v}" for k, v in kw.items())
+            print(s)
 
         if "min_char_px_img" in kwargs:
             try:
@@ -1579,7 +1593,9 @@ class   RendererV3(object):
                 pass
 
         if img is None:
+            _dbg("fail: img is None")
             return None, None, None
+
         H_img, W_img = img.shape[:2]
         self._img_shape_last = (H_img, W_img)
 
@@ -1588,6 +1604,7 @@ class   RendererV3(object):
 
         cache = self._region_cache
         if not cache or not cache.get("candidates"):
+            _dbg("fail: region_cache empty")
             return None, None, None
 
         topk = int(getattr(self, "region_select_topk", 6))
@@ -1613,7 +1630,8 @@ class   RendererV3(object):
                     return True
                 roi = occupied_global[y0:y1, x0:x1]
                 occ = float((roi > 0).mean())
-                return occ < float(getattr(self, "occupied_bbox_max_frac", 0.15))
+                ok = occ < float(getattr(self, "occupied_bbox_max_frac", 0.15))
+                return ok
             except Exception:
                 return True
 
@@ -1623,17 +1641,22 @@ class   RendererV3(object):
             i = int(i)
 
             if i < 0 or i >= len(cache["banned"]):
+                _dbg("reject: idx out of range", i=i, n=len(cache["banned"]))
                 return None, None, None
             if bool(cache["banned"][i]):
+                _dbg("reject: banned", i=i)
                 return None, None, None
             if avoid_repeat and (i in used):
+                _dbg("reject: already used", i=i)
                 return None, None, None
             if not _occupied_ok(cache["bbox_img"][i]):
+                _dbg("reject: occupied_global", i=i, bbox=cache["bbox_img"][i])
                 return None, None, None
 
             fp_w, fp_h = cache["fp_wh"][i]
             fp_w = float(fp_w); fp_h = float(fp_h)
             if fp_w <= 0 or fp_h <= 0:
+                _dbg("reject: bad fp_wh", i=i, fp_w=fp_w, fp_h=fp_h)
                 return None, None, None
 
             s = float(cache["s_loc"][i])
@@ -1651,27 +1674,29 @@ class   RendererV3(object):
 
             f_max = float(min(f_max_w, f_max_h))
             if (not np.isfinite(f_max)) or (f_max < float(min_font_px)):
+                _dbg("reject: f_max too small", i=i, f_max=round(f_max, 2), min_font_px=min_font_px,
+                    fp_w=int(fp_w), fp_h=int(fp_h), nchar=nchar_eff, nline=nline_eff, f_asp=round(float(f_asp), 3))
                 return None, None, None
 
             f_nom = f_max * float(fill)
             f_min_req = float(min_text_px_img) / max(1e-6, s)
             f_fit = float(max(f_nom, f_min_req, float(min_font_px)))
             if f_fit > f_max:
+                _dbg("reject: f_fit > f_max", i=i, f_fit=round(f_fit, 2), f_max=round(f_max, 2),
+                    min_text_px_img=min_text_px_img, s_loc=round(float(s), 3))
                 return None, None, None
 
             base_ang = float(cache["base_angle"][i])
             selected_angle = base_ang + float(np.random.uniform(-angle_jitter, angle_jitter))
 
-            if avoid_repeat:
-                used.add(i)
-
+            _dbg("accept", i=i, f_fit=round(f_fit, 2), base_ang=round(base_ang, 1),
+                sel_ang=round(selected_angle, 1), s_loc=round(float(s), 3))
             return i, f_fit, selected_angle
 
-        # --- режим "принудительно этот регион" ---
         if force_ireg is not None:
+            _dbg("force_ireg", force_ireg=int(force_ireg))
             return _try_region(int(force_ireg))
 
-        # --- стандартный режим (как было) ---
         cand = cache["candidates"]
         pick_pool = cand[:max(1, min(topk, len(cand)))]
 
@@ -1679,18 +1704,21 @@ class   RendererV3(object):
         scores = np.maximum(scores, 1e-9)
         probs = scores / scores.sum()
 
-        for _ in range(int(tries)):
+        for t in range(int(tries)):
             i = int(np.random.choice(pick_pool, p=probs))
             out = _try_region(i)
             if out[0] is not None:
                 return out
+            _dbg("try failed", t=t, picked=i)
 
+        _dbg("fail: no region matched", tries=tries, topk=topk, pool=len(pick_pool))
         return None, None, None
 
 
+
     def place_text_textfirst(self, img, place_masks, regions, gap=6,
-                    min_font_px=14, start_font_px=None, start_font_px_range=None,
-                    shrink_step=0.90, depth=None, occupied_global=None, force_ireg=None):
+        min_font_px=14, start_font_px=None, start_font_px_range=None,
+        shrink_step=0.90, depth=None, occupied_global=None, force_ireg=None):
         import numpy as np
 
         debug_txt = bool(getattr(self, "debug_txt", False))
@@ -1703,11 +1731,31 @@ class   RendererV3(object):
                 s += " | " + ", ".join(f"{k}={v}" for k, v in kw.items())
             print(s)
 
+        if img is None:
+            _dbg("fail: img is None")
+            return None
+
         H_img, W_img = img.shape[:2]
         self._img_shape_last = (H_img, W_img)
 
-        if not place_masks:
+        # place_masks может быть list; если numpy-массив, "if not place_masks" может падать
+        try:
+            if place_masks is None or len(place_masks) == 0:
+                _dbg("fail: empty place_masks")
+                return None
+        except Exception:
+            _dbg("fail: place_masks len() failed")
             return None
+
+        # ✅ per-image failed pairs (НЕ глобальные)
+        if not hasattr(self, "_failed_pairs_this_image") or self._failed_pairs_this_image is None:
+            self._failed_pairs_this_image = set()
+        if not hasattr(self, "_failed_pair_counts_this_image") or self._failed_pair_counts_this_image is None:
+            self._failed_pair_counts_this_image = {}
+
+        failed_set = self._failed_pairs_this_image
+        failed_cnt = self._failed_pair_counts_this_image
+        ban_after = int(getattr(self, "failed_pair_ban_after", 3))
 
         # --- font init ---
         try:
@@ -1716,7 +1764,8 @@ class   RendererV3(object):
             f_asp = float(self.text_renderer.font_state.get_aspect_ratio(font))
             if not np.isfinite(f_asp) or f_asp <= 1e-6:
                 f_asp = 1.0
-        except Exception:
+        except Exception as e:
+            _dbg("fail: font init", err=repr(e))
             return None
 
         short_side = float(min(H_img, W_img))
@@ -1750,7 +1799,8 @@ class   RendererV3(object):
                 f_layout = int(min_font_px)
 
             _dbg("font sizing", source=src, f_start=round(f_start, 2), f_layout=f_layout, f_asp=round(float(f_asp), 3))
-        except Exception:
+        except Exception as e:
+            _dbg("fail: font sizing", err=repr(e))
             return None
 
         # --- layout ---
@@ -1762,24 +1812,29 @@ class   RendererV3(object):
         nline_eff = max(1, int(nline_raw or 1))
         nchar_eff = 10 if (nchar_raw is None or int(nchar_raw) < 6) else int(nchar_raw)
 
-        # --- text sample ---
+        # --- text sample (NEW: получаем язык) ---
         try:
-            txt_str = self._sample_layout_text(nline_eff, nchar_eff, max_retries=5)
-        except Exception:
+            txt_str, txt_lang = self._sample_layout_text(nline_eff, nchar_eff, max_retries=5)
+        except Exception as e:
+            _dbg("fail: _sample_layout_text exception", err=repr(e))
             return None
 
         if not txt_str or not isinstance(txt_str, str) or not txt_str.strip():
+            _dbg("fail: sampled empty text", txt=repr(txt_str))
             return None
         txt_str = txt_str.strip()
+        if not txt_lang:
+            txt_lang = "unk"
 
-        # --- убедимся, что кэш регионов посчитан ---
+        # --- ensure cache ---
         if (not hasattr(self, "_region_cache")) or (self._region_cache is None) or (not self._region_cache.get("candidates")):
             self._ensure_region_cache(img, place_masks, regions)
         cache = self._region_cache
         if not cache or not cache.get("candidates"):
+            _dbg("fail: region cache empty after build")
             return None
 
-        # --- select region (или force_ireg) ---
+        # --- select region ---
         ireg, f_fit, selected_angle = self.select_region_for_text(
             txt_str, font, f_layout, f_asp, place_masks, regions,
             gap_px=gap,
@@ -1795,11 +1850,12 @@ class   RendererV3(object):
             force_ireg=force_ireg
         )
         if ireg is None:
+            _dbg("fail: select_region_for_text returned None", force_ireg=force_ireg, txt=txt_str)
             return None
 
-        # --- region quad + bbox + s_loc из кэша ---
         region_coords = cache["quad_img"][ireg]
         if region_coords is None:
+            _dbg("fail: cache quad_img is None", ireg=ireg)
             return None
 
         (x0, y0, x1, y1) = cache["bbox_img"][ireg]
@@ -1834,7 +1890,6 @@ class   RendererV3(object):
         f_max_fp = max(float(min_font_px), float(f_layout) * 2.2)
         f_target_fp = float(np.clip(f_target_fp, float(min_font_px), float(f_max_fp)))
 
-        # --- проверим влезание в FP bbox ---
         (x0fp, y0fp, x1fp, y1fp) = cache["fp_bbox"][ireg]
         W_reg = float(max(2, int(x1fp - x0fp + 1)))
         H_reg = float(max(2, int(y1fp - y0fp + 1)))
@@ -1860,63 +1915,106 @@ class   RendererV3(object):
             f_final = float(f_fit)
 
         _dbg("visual sizing",
-            nchar=nchar_eff,
-            s_loc=round(float(s_loc), 3),
-            near_w=round(float(near_w), 1),
-            near_h=round(float(near_h), 1),
-            fill=round(float(fill), 2),
-            char_h_px=round(float(char_h_px), 1),
-            f_fit=round(float(f_fit), 1),
-            f_target_fp=round(float(f_target_fp), 1),
-            f_final=round(float(f_final), 1),
-            force_ireg=force_ireg
+            ireg=ireg, txt=txt_str, nchar=nchar_eff, nline=nline_eff,
+            s_loc=round(float(s_loc), 3), near_w=round(float(near_w), 1), near_h=round(float(near_h), 1),
+            fill=round(float(fill), 2), char_h_px=round(float(char_h_px), 1),
+            f_fit=round(float(f_fit), 1), f_target_fp=round(float(f_target_fp), 1),
+            f_final=round(float(f_final), 1), tries_shrink=tries, force_ireg=force_ireg
         )
 
-        # failed cache
-        key = (int(ireg), int(round(float(f_final))))
-        if hasattr(self, "_failed_pairs") and (key in self._failed_pairs):
-            return None
+        # ✅ ключ делаем чуть устойчивее (не только ireg+font)
+        key = (int(ireg), int(round(float(f_final))), int(nchar_eff), int(nline_eff))
+
+        # если ключ уже забанен — пробуем "чуть меньше" (другой ключ), а не сразу отваливаемся
+        if key in failed_set:
+            f2 = max(float(min_font_px), float(f_final) * 0.92)
+            key2 = (int(ireg), int(round(float(f2))), int(nchar_eff), int(nline_eff))
+            if key2 not in failed_set:
+                _dbg("failed_pairs: key banned -> try smaller f_final", key=key, key2=key2)
+                f_final = f2
+                key = key2
+            else:
+                _dbg("fail: in failed_pairs cache", key=key)
+                return None
+
+        def _bump_fail(reason: str):
+            c = int(failed_cnt.get(key, 0)) + 1
+            failed_cnt[key] = c
+            banned = False
+            if c >= ban_after:
+                failed_set.add(key)
+                banned = True
+            _dbg("pair fail", key=key, reason=reason, count=c, ban_after=ban_after, banned=banned)
 
         # set font.size
         try:
             font.size = self.text_renderer.font_state.get_font_size(font, float(f_final))
-        except Exception:
+        except Exception as e:
+            _dbg("fail: set font.size", err=repr(e), f_final=round(float(f_final), 2))
+            _bump_fail("set_font_size")
             return None
 
-        # render overlay
-        try:
-            img_new, bb_img, text_mask_img = self.render_text_overlay(
+        # render overlay (с fallback по sky-ban)
+        def _call_overlay():
+            return self.render_text_overlay(
                 img, txt_str, font,
                 selected_angle=selected_angle,
                 region_coords=region_coords,
                 depth=depth
             )
-        except Exception:
-            try:
-                if hasattr(self, "_failed_pairs"):
-                    self._failed_pairs.add(key)
-            except Exception:
-                pass
+
+        try:
+            img_new, bb_img, text_mask_img = _call_overlay()
+        except Exception as e:
+            _dbg("fail: render_text_overlay exception", err=repr(e))
+            _bump_fail("overlay_exc")
             return None
+
+        # fallback: если отвалилось, а bbox точно НЕ в верхней части кадра — вероятно sky-ban ложноположительный
+        if (img_new is None or text_mask_img is None):
+            disallow_sky = bool(getattr(self, "overlay_disallow_sky", True))
+            if disallow_sky:
+                y_center = (float(y0) + float(y1)) * 0.5 / max(1.0, float(H_img))
+                y_thr = float(getattr(self, "overlay_sky_fallback_min_y", 0.30))
+                if y_center >= y_thr:
+                    _dbg("overlay fallback: disable sky-ban once", y_center=round(y_center, 3), thr=round(y_thr, 3))
+                    old = getattr(self, "overlay_disallow_sky", True)
+                    try:
+                        self.overlay_disallow_sky = False
+                        img_new2, bb_img2, text_mask_img2 = _call_overlay()
+                        if img_new2 is not None and text_mask_img2 is not None:
+                            img_new, bb_img, text_mask_img = img_new2, bb_img2, text_mask_img2
+                    finally:
+                        self.overlay_disallow_sky = old
 
         if img_new is None or text_mask_img is None:
-            try:
-                if hasattr(self, "_failed_pairs"):
-                    self._failed_pairs.add(key)
-            except Exception:
-                pass
+            _dbg("fail: render_text_overlay returned None",
+                img_new_is_none=(img_new is None), mask_is_none=(text_mask_img is None))
+            _bump_fail("overlay_none")
             return None
 
-        if int((text_mask_img > 0).sum()) == 0:
-            try:
-                if hasattr(self, "_failed_pairs"):
-                    self._failed_pairs.add(key)
-            except Exception:
-                pass
+        nz = int((text_mask_img > 0).sum())
+        if nz == 0:
+            _dbg("fail: text_mask_img empty after overlay", nz=nz)
+            _bump_fail("mask_empty")
             return None
+
+        # ✅ помечаем used (только после успеха!)
+        try:
+            if bool(getattr(self, "avoid_repeat_region", True)):
+                if not hasattr(self, "_used_regions_this_image") or self._used_regions_this_image is None:
+                    self._used_regions_this_image = set()
+                self._used_regions_this_image.add(int(ireg))
+        except Exception:
+            pass
 
         self.last_font_h_px = float(f_final)
-        return img_new, txt_str, bb_img, text_mask_img
+        _dbg("success", ireg=ireg, key=key, mask_nz=nz, lang=txt_lang)
+
+        # NEW: возвращаем язык 5-м элементом
+        return img_new, txt_str, bb_img, text_mask_img, txt_lang
+
+
 
 
 
@@ -2044,8 +2142,8 @@ class   RendererV3(object):
     def _sample_layout_text(self, nline, nchar, max_retries=20):
         """
         Берёт слова последовательно из очереди.
-        Если очередь пуста — набивает её из text_source.sample(...).
-        Фоллбэка "пример" больше нет: если уж совсем нечего — берём любое слово без min_len.
+        Очередь хранит tuples: (word, lang).
+        Если очередь пуста — набивает её из text_source.sample(..., return_lang=True).
         """
         import re
         from collections import deque
@@ -2060,22 +2158,29 @@ class   RendererV3(object):
 
         # 1) если есть запас — отдаём следующее
         while self._word_queue:
-            w = self._word_queue.popleft()
+            item = self._word_queue.popleft()
+            if isinstance(item, (tuple, list)) and len(item) >= 2:
+                w, lang = item[0], item[1]
+            else:
+                w, lang = str(item), "unk"
+
             if len(w) >= min_len:
-                return w
+                return w, lang
 
         # 2) иначе пытаемся набить очередь
         last_raw_text = ""
-        for _ in range(max_retries):
+        last_lang = "unk"
+
+        for _ in range(int(max_retries)):
             try:
                 kind = tu.sample_weighted(self.text_renderer.p_text)
             except Exception:
                 kind = None
 
             try:
-                raw_obj = self.text_renderer.text_source.sample(nline, nchar, kind)
+                raw_obj, last_lang = self.text_renderer.text_source.sample(nline, nchar, kind, return_lang=True)
             except Exception:
-                raw_obj = None
+                raw_obj, last_lang = None, "unk"
 
             if isinstance(raw_obj, list):
                 last_raw_text = " ".join(str(x).strip() for x in raw_obj if str(x).strip())
@@ -2091,20 +2196,21 @@ class   RendererV3(object):
             if not words:
                 continue
 
-            self._word_queue = deque(words)
+            self._word_queue = deque((w, last_lang) for w in words)
 
             while self._word_queue:
-                w = self._word_queue.popleft()
+                w, lang = self._word_queue.popleft()
                 if len(w) >= min_len:
-                    return w
+                    return w, lang
 
         # 3) если совсем не получилось — берём любое слово без min_len
         if last_raw_text:
             words = tokenize(last_raw_text)
             if words:
-                return words[0]
+                return words[0], last_lang
 
-        return "text"
+        return "text", "unk"
+
 
     def estimate_region_angle_from_seg(self, seg, lbl):
         """
@@ -3022,6 +3128,9 @@ class   RendererV3(object):
             H_img, W_img = img.shape[:2]
             debug = bool(getattr(self, "debug_hgeom", False))
 
+            # ✅ NEW: если выключены все аугментации — не делаем синтетическую окклюзию
+            disable_all_augs = bool(getattr(self, "disable_all_augs", False))
+
             dst_quad = self._overlay_resolve_target_quad(region_coords)
             if dst_quad is None:
                 if debug:
@@ -3122,7 +3231,9 @@ class   RendererV3(object):
             canvas_scale = float(getattr(self, "overlay_canvas_scale", 1.35))
             canvas_scale = max(1.0, min(2.5, canvas_scale))
 
-            Wc, Hc = self._overlay_canvas_size_from_quad(dst_quad, min_size=min_canvas, max_size=max_canvas, scale=canvas_scale)
+            Wc, Hc = self._overlay_canvas_size_from_quad(
+                dst_quad, min_size=min_canvas, max_size=max_canvas, scale=canvas_scale
+            )
 
             # render local
             rgb_loc = a_loc = None
@@ -3152,7 +3263,9 @@ class   RendererV3(object):
             # fit into canvas
             fill = float(getattr(self, "overlay_text_fill", 0.68))
             max_up = float(getattr(self, "overlay_text_max_up", 1.20))
-            rgb_loc, a_loc = self._overlay_fit_rgba_into_canvas(rgb_loc, a_loc, fill=fill, thr=8, allow_upscale=True, max_up=max_up)
+            rgb_loc, a_loc = self._overlay_fit_rgba_into_canvas(
+                rgb_loc, a_loc, fill=fill, thr=8, allow_upscale=True, max_up=max_up
+            )
 
             # warp to image
             warped_rgb, warped_a_full = self._overlay_warp_rgba_to_image(rgb_loc, a_loc, dst_quad, (H_img, W_img))
@@ -3179,15 +3292,18 @@ class   RendererV3(object):
             # --- synthetic controlled occlusion ---
             warped_a_vis = warped_a_full
             occ_mask_u8 = None
-            try:
-                warped_rgb, warped_a_vis, _occ_rgb_unused, occ_mask_u8 = self._overlay_apply_synth_occlusion(
-                    img, warped_rgb, warped_a_full, alpha_thr=alpha_thr
-                )
-            except Exception as e:
-                if debug:
-                    print("[OVERLAY] _overlay_apply_synth_occlusion exception:", repr(e))
-                warped_a_vis = warped_a_full
-                occ_mask_u8 = None
+
+            # ✅ NEW: окклюзию делаем только если disable_all_augs == False
+            if not disable_all_augs:
+                try:
+                    warped_rgb, warped_a_vis, _occ_rgb_unused, occ_mask_u8 = self._overlay_apply_synth_occlusion(
+                        img, warped_rgb, warped_a_full, alpha_thr=alpha_thr
+                    )
+                except Exception as e:
+                    if debug:
+                        print("[OVERLAY] _overlay_apply_synth_occlusion exception:", repr(e))
+                    warped_a_vis = warped_a_full
+                    occ_mask_u8 = None
 
             # какую маску возвращать наружу (видимую или полную)
             return_visible_mask = bool(getattr(self, "overlay_return_visible_mask", False))
@@ -3204,7 +3320,6 @@ class   RendererV3(object):
                     return None, None, None
 
             # --- background rectangle ---
-            # Ключевой переключатель:
             # True  -> фон под текстом только там, где текст ВИДИМ (после окклюзии)
             # False -> фон под текстом по ПОЛНОЙ альфе (чтобы окклюзия не "выбивалась" цветом)
             use_visible_alpha_for_bg = bool(getattr(self, "overlay_bg_use_visible_alpha", False))
@@ -3217,8 +3332,6 @@ class   RendererV3(object):
             img_new = self._overlay_alpha_blend(img_bg, warped_rgb, warped_a_vis)
 
             # --- заполнение зоны окклюдера ---
-            # Обычно НЕ нужно (альфа уже убита), но полезно если ты хочешь "гарантировать"
-            # совпадение цвета/освещения именно с фоном под текстом.
             if occ_mask_u8 is not None:
                 m = (occ_mask_u8 > 0)
 
@@ -3233,9 +3346,6 @@ class   RendererV3(object):
                         tmp[ring] = np.clip(tmp[ring] * (1.0 - shadow), 0, 255)
                         img_new = tmp.astype(np.uint8)
 
-                # чем заполнять “перекрытие”
-                # "img_bg" -> совпадает с фоном под текстом (обычно самое стабильное)
-                # "img"    -> совпадает с исходной сценой (если ты НЕ хочешь, чтобы bg-rect “оставался”)
                 fill_source = str(getattr(self, "overlay_occ_fill_source", "img_bg")).lower()
                 fill_img = img if fill_source == "img" else img_bg
                 img_new[m] = fill_img[m]
@@ -3254,6 +3364,7 @@ class   RendererV3(object):
             print("[OVERLAY] UNHANDLED EXCEPTION:", repr(e))
             traceback.print_exc()
             return None, None, None
+
 
 
 
@@ -3333,11 +3444,20 @@ class   RendererV3(object):
 
         debug_regions = bool(getattr(self, "debug_regions", False))
 
+        def _dbg(msg, **kw):
+            if not debug_regions:
+                return
+            s = f"[render_text] {msg}"
+            if kw:
+                s += " | " + ", ".join(f"{k}={v}" for k, v in kw.items())
+            print(s)
+
         try:
             depth = np.asarray(depth)
             rgb = np.asarray(rgb)
             seg = np.asarray(seg)
-        except Exception:
+        except Exception as e:
+            _dbg("fail: input to np.asarray", err=repr(e))
             return []
 
         depth_f = np.nan_to_num(depth, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32, copy=False)
@@ -3354,25 +3474,27 @@ class   RendererV3(object):
         disable_augs = bool(getattr(self, "disable_all_augs", True))
 
         try:
-            if debug_regions:
-                print("[render_text] start:", rgb.shape, seg_i.shape, "ninstance=", ninstance)
+            _dbg("start", rgb_shape=tuple(rgb.shape), seg_shape=tuple(seg_i.shape), ninstance=int(ninstance))
 
             xyz = su.DepthCamera.depth2xyz(depth_f)
 
             regions = TextRegions.get_regions(xyz, seg_i, area, label)
-            if debug_regions:
-                print("[render_text] get_regions ->", len(regions.get("label", [])))
+            _dbg("get_regions", n=int(len(regions.get("label", []))))
 
             regions = TextRegions.filter_depth(xyz, seg_i, regions)
-            if debug_regions:
-                print("[render_text] filter_depth ->", len(regions.get("label", [])))
+            _dbg("filter_depth", n=int(len(regions.get("label", []))))
 
             regions = self.filter_for_placement(xyz, seg_i, regions, viz=False)
-            if regions is None or len(regions.get("place_mask", [])) == 0:
+            if regions is None:
+                _dbg("stop: filter_for_placement returned None")
+                return []
+            if len(regions.get("place_mask", [])) == 0:
+                _dbg("stop: filter_for_placement has 0 place_mask")
                 return []
 
             nregions = len(regions["place_mask"])
             if nregions < 1:
+                _dbg("stop: nregions < 1")
                 return []
 
             max_texts = int(getattr(self, "max_text_instances", 4))
@@ -3389,22 +3511,28 @@ class   RendererV3(object):
 
             self._ensure_region_cache(rgb, regions["place_mask"], regions)
 
+            _dbg("budgets", nregions=nregions, target_blocks=target_blocks,
+                global_budget=int(self.global_attempt_budget),
+                per_region_cap=int(self.per_region_attempt_cap))
         except Exception as e:
-            if debug_regions:
-                print("[render_text] region prep error:", repr(e))
+            _dbg("region prep error", err=repr(e))
             return []
 
         res = []
 
-        for _ in range(int(ninstance)):
+        for inst in range(int(ninstance)):
             img = rgb.copy()
-            itext, ibb = [], []
+            itext, ibb, ilangs = [], [], []
             occupied_global = np.zeros(img.shape[:2], dtype=np.uint8)
 
+            # ✅ per-output-image state (важно!)
             self._used_regions_this_image = set()
+            self._failed_pairs_this_image = set()
+            self._failed_pair_counts_this_image = {}
 
             nregions = len(regions["place_mask"])
             if nregions <= 0:
+                _dbg("instance skip: nregions<=0", inst=inst)
                 continue
 
             max_texts = int(getattr(self, "max_text_instances", 4))
@@ -3421,16 +3549,18 @@ class   RendererV3(object):
             ksz = int(2 * gap_px + 1)
             ker = self._get_cached_kernel(ksz)
 
+            stats = {"place_none": 0, "overlay_none": 0, "mask_empty": 0, "overlap": 0, "placed": 0}
+
+            _dbg("instance start",
+                inst=inst, target_blocks=target_blocks, nregions=nregions,
+                tries_left=tries_left, per_region_cap=per_region_cap)
+
             for ireg in region_order:
-                if placed_count >= target_blocks:
-                    break
-                if tries_left <= 0:
+                if placed_count >= target_blocks or tries_left <= 0:
                     break
 
                 for _t in range(per_region_cap):
-                    if placed_count >= target_blocks:
-                        break
-                    if tries_left <= 0:
+                    if placed_count >= target_blocks or tries_left <= 0:
                         break
                     tries_left -= 1
 
@@ -3446,18 +3576,31 @@ class   RendererV3(object):
                         force_ireg=int(ireg)
                     )
                     if txt_render_res is None:
+                        stats["place_none"] += 1
                         continue
 
-                    img_new, text, bb, warped_mask = txt_render_res
+                    # NEW: ожидаем 5 значений
+                    try:
+                        img_new, text, bb, warped_mask, txt_lang = txt_render_res
+                    except Exception:
+                        stats["place_none"] += 1
+                        continue
+
+                    if not txt_lang:
+                        txt_lang = "unk"
+
                     if img_new is None or warped_mask is None:
+                        stats["overlay_none"] += 1
                         continue
 
                     m_img = (warped_mask > 0).astype(np.uint8) * 255
                     if int(m_img.sum()) == 0:
+                        stats["mask_empty"] += 1
                         continue
 
                     overlap = cv2.bitwise_and(occupied_global, m_img)
                     if int(overlap.sum()) > 0:
+                        stats["overlap"] += 1
                         continue
 
                     m_inflated = cv2.dilate(m_img, ker, 1)
@@ -3465,20 +3608,35 @@ class   RendererV3(object):
 
                     img = img_new
                     itext.append(text)
+                    ilangs.append(txt_lang)
                     ibb.append(bb)
                     placed_count += 1
+                    stats["placed"] += 1
+
+                    _dbg("placed",
+                        inst=inst, ireg=int(ireg),
+                        placed_count=placed_count, target_blocks=target_blocks,
+                        tries_left=tries_left, text=text, lang=txt_lang)
                     break  # 1 текст на регион
 
             if placed_count == 0:
+                _dbg("instance result: placed_count==0",
+                    inst=inst, target_blocks=target_blocks,
+                    tries_left=tries_left, stats=stats)
                 continue
 
-            idict = {'img': img, 'txt': itext, 'charBB': None, 'wordBB': None}
+            _dbg("instance result: success",
+                inst=inst, placed_count=placed_count, target_blocks=target_blocks,
+                tries_left=tries_left, stats=stats)
+
+            idict = {'img': img, 'txt': itext, 'lang': ilangs, 'charBB': None, 'wordBB': None}
 
             bbs_valid = [b for b in ibb if b is not None and hasattr(b, "shape") and b.size > 0]
             if bbs_valid:
                 try:
                     idict['charBB'] = np.concatenate(bbs_valid, axis=2)
-                except Exception:
+                except Exception as e:
+                    _dbg("warn: concat charBB failed", err=repr(e), n=len(bbs_valid))
                     idict['charBB'] = None
 
             if idict['charBB'] is not None:
@@ -3489,23 +3647,19 @@ class   RendererV3(object):
                         ' '.join(itext),
                         pad_px=4, pad_rel=0.05, clamp_shape=(H, W)
                     )
-                except Exception:
+                except Exception as e:
+                    _dbg("warn: char2wordBB failed", err=repr(e))
                     idict['wordBB'] = None
 
-            # ============================
-            # ✅ ШУМЫ / ДЕГРАДАЦИЯ ПОСЛЕ ВСЕГО
-            # ============================
             if not disable_augs:
                 try:
                     from noise_utils import apply_noise_recipe
-
                     cfg = getattr(self, "noise_cfg", None)
 
-                    # можно настраивать через self:
-                    p_none = float(getattr(self, "noise_p_none", 0.12))         # шанс “вообще без ауг”
-                    p_boost = float(getattr(self, "noise_p_boost", 1.0))        # чаще
-                    strength = float(getattr(self, "noise_strength", 1.0))      # сильнее
-                    force_one = bool(getattr(self, "noise_force_one", False))   # НЕ включай, если хочешь иногда “нулевую”
+                    p_none = float(getattr(self, "noise_p_none", 0.12))
+                    p_boost = float(getattr(self, "noise_p_boost", 1.0))
+                    strength = float(getattr(self, "noise_strength", 1.0))
+                    force_one = bool(getattr(self, "noise_force_one", False))
 
                     idict["img"], applied = apply_noise_recipe(
                         idict["img"],
@@ -3515,29 +3669,11 @@ class   RendererV3(object):
                         strength=strength,
                         force_at_least_one=force_one,
                     )
-
-                    if debug_regions:
-                        print("[render_text] noise applied:", applied)
-
+                    _dbg("augs applied", inst=inst, applied=applied)
                 except Exception as e:
-                    if debug_regions:
-                        print("[render_text] post-noise error:", repr(e))
-                    pass
+                    _dbg("warn: augs failed", inst=inst, err=repr(e))
 
-            if viz:
-                try:
-                    if idict['wordBB'] is not None:
-                        viz_textbb(1, idict['img'], [idict['wordBB']], alpha=1.0)
-                    else:
-                        import matplotlib.pyplot as plt
-                        plt.figure(1); plt.clf()
-                        plt.imshow(_rgb(idict['img']))
-                        plt.axis('off')
-                        _plt_stable_draw(plt.gcf(), pause=0.35)
-                    viz_masks(2, idict['img'], seg_i, depth_f, regions['label'])
-                except Exception:
-                    pass
+            res.append(idict)
 
-            res.append(idict.copy())
-
+        _dbg("done", out_n=int(len(res)))
         return res
