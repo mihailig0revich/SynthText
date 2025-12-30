@@ -456,9 +456,9 @@ def apply_noise_recipe(
     - p_none_eff не умножаем на p_boost, иначе усиление “убьёт” шанс полного отсутствия.
     - Если force_at_least_one=False и ничего не сработало по рандому — вернёт ["none_by_draw"].
 
-    ИЗМЕНЕНО В ЭТОЙ ВЕРСИИ:
-    - Ослаблены ИМЕННО шумы: gaussian / speckle / salt&pepper
-    - Цветовые изменения и размытие (motion blur) не трогал.
+    ДОБАВЛЕНО:
+    - "tiers" (weak/med/strong): сильные аугментации реже, средние чаще, слабые чаще всего.
+      Реализовано через модификацию p_boost_eff / strength_eff / p_none_eff перед применением операций.
     """
     import numpy as np
 
@@ -482,10 +482,59 @@ def apply_noise_recipe(
     p_boost_eff = max(0.0, p_boost_eff)
     strength_eff = max(0.0, strength_eff)
 
-    # ✅ шанс полностью пропустить ВСЁ
+    # ============================================================
+    # ✅ NEW: tier-логика (weak/med/strong)
+    # ============================================================
+    # Можно принудительно задать tier через cfg["tier"] = "weak"/"med"/"strong"
+    forced_tier = cfg.get("tier", None)
+
+    tier_probs = cfg.get("tier_probs", {"weak": 0.60, "med": 0.30, "strong": 0.10})
+    pw = float(tier_probs.get("weak", 0.60))
+    pm = float(tier_probs.get("med", 0.30))
+    ps = float(tier_probs.get("strong", 0.10))
+    ssum = max(1e-9, pw + pm + ps)
+    pw, pm, ps = pw / ssum, pm / ssum, ps / ssum
+
+    # Диапазоны множителей (можно переопределять через cfg)
+    tier_ranges = cfg.get("tier_ranges", {
+        "weak":   {"strength": (0.75, 1.00), "p_boost": (0.90, 1.10), "p_none": (1.00, 1.20)},
+        "med":    {"strength": (1.00, 1.35), "p_boost": (1.05, 1.25), "p_none": (0.90, 1.05)},
+        "strong": {"strength": (1.45, 2.10), "p_boost": (1.25, 1.60), "p_none": (0.65, 0.90)},
+    })
+
+    if forced_tier in ("weak", "med", "strong"):
+        tier = forced_tier
+    else:
+        r = float(rnd())
+        if r < pw:
+            tier = "weak"
+        elif r < pw + pm:
+            tier = "med"
+        else:
+            tier = "strong"
+
+    def _pick_range(tier_name: str, key: str, fallback: tuple[float, float]) -> float:
+        rr = tier_ranges.get(tier_name, {})
+        lo, hi = rr.get(key, fallback)
+        lo = float(lo); hi = float(hi)
+        if hi < lo:
+            lo, hi = hi, lo
+        return float(np.random.uniform(lo, hi))
+
+    strength_mul = _pick_range(tier, "strength", (1.0, 1.0))
+    p_boost_mul  = _pick_range(tier, "p_boost", (1.0, 1.0))
+    p_none_mul   = _pick_range(tier, "p_none", (1.0, 1.0))
+
+    strength_eff = max(0.0, strength_eff * strength_mul)
+    p_boost_eff  = max(0.0, p_boost_eff * p_boost_mul)
+    p_none_eff   = _clamp01(p_none_eff * p_none_mul)
+
+    # ============================================================
+    # ✅ шанс полностью пропустить ВСЁ (после tier-модификации)
+    # ============================================================
     if rnd() < p_none_eff:
         if debug:
-            print(f"[NOISE] none gate: p_none={p_none_eff:.3f} -> SKIP ALL")
+            print(f"[NOISE] tier={tier} none gate: p_none={p_none_eff:.3f} -> SKIP ALL")
         return img, ["none"]
 
     def P(key: str, base: float) -> float:
@@ -502,7 +551,6 @@ def apply_noise_recipe(
     # ------------------------------------------------------------
     # 1) ОСВЕЩЕНИЕ / КОНТРАСТ
     # ------------------------------------------------------------
-    # (a) контраст “время суток”
     if P("p_contrast", 0.85) > 0 and rnd() < P("p_contrast", 0.85):
         try:
             out = adjust_contrast_time_of_day(out)
@@ -510,7 +558,6 @@ def apply_noise_recipe(
         except Exception:
             pass
 
-    # (b) глобальное затемнение/гамма (освещение)
     if P("p_darken", 0.70) > 0 and rnd() < P("p_darken", 0.70):
         try:
             lo = max(0.55, 0.80 - 0.18 * (strength_eff - 1.0))
@@ -531,10 +578,8 @@ def apply_noise_recipe(
     # ------------------------------------------------------------
     # 2) “ПЛОХАЯ КАМЕРА”
     # ------------------------------------------------------------
-    # ✅ Гаусс — ОСЛАБЛЕНО (только шум)
     if rnd() < P("p_gauss", 0.90):
         try:
-            # было: U(0.030, 0.070) * (0.85 + 0.35*strength)
             sigma = U(0.018, 0.045) * (0.80 + 0.25 * strength_eff)
             sigma = float(np.clip(sigma, 0.006, 0.080))
             out = noise_gaussian(out, sigma=sigma)
@@ -542,10 +587,8 @@ def apply_noise_recipe(
         except Exception:
             pass
 
-    # ✅ Speckle — ОСЛАБЛЕНО (только шум)
     if rnd() < P("p_speckle", 0.88):
         try:
-            # было: U(0.040, 0.095) * (0.85 + 0.35*strength)
             sigma = U(0.020, 0.055) * (0.80 + 0.25 * strength_eff)
             sigma = float(np.clip(sigma, 0.006, 0.110))
             out = noise_speckle(out, sigma=sigma)
@@ -553,10 +596,8 @@ def apply_noise_recipe(
         except Exception:
             pass
 
-    # ✅ Salt&pepper — ОСЛАБЛЕНО СИЛЬНО (только шум)
     if rnd() < P("p_sap", 0.55):
         try:
-            # было: U(0.020, 0.090) * (0.90 + 0.40*strength)
             amt = U(0.004, 0.035) * (0.85 + 0.20 * strength_eff)
             amt = float(np.clip(amt, 0.001, 0.090))
             out = noise_saltpepper(out, amount=amt, s_vs_p=0.5)
@@ -564,7 +605,6 @@ def apply_noise_recipe(
         except Exception:
             pass
 
-    # Motion blur — НЕ ТРОГАЛ (ты просил не ослаблять размытие)
     if rnd() < P("p_motion", 0.40):
         try:
             kmax = int(np.clip(round(8 + 6 * max(0.0, strength_eff - 1.0)), 8, 17))
@@ -575,7 +615,6 @@ def apply_noise_recipe(
         except Exception:
             pass
 
-    # Vignette — не трогал (это не “шум”)
     if rnd() < P("p_vignette", 0.55):
         try:
             v = U(0.10, 0.32) * (0.90 + 0.35 * strength_eff)
@@ -585,7 +624,6 @@ def apply_noise_recipe(
         except Exception:
             pass
 
-    # Color jitter — НЕ ТРОГАЛ (ты просил не ослаблять изменение цвета)
     if rnd() < P("p_color", 0.85):
         try:
             hue = U(6, 14) * (0.85 + 0.35 * strength_eff)
@@ -596,7 +634,6 @@ def apply_noise_recipe(
         except Exception:
             pass
 
-    # JPEG — не трогал (оставил как было)
     if rnd() < P("p_jpeg", 0.90):
         try:
             q_hi = 90
@@ -635,6 +672,7 @@ def apply_noise_recipe(
             applied = ["none_by_draw"]
 
     if debug:
+        print(f"[NOISE] tier={tier} p_none={p_none_eff:.3f} p_boost={p_boost_eff:.3f} strength={strength_eff:.3f}")
         print("[NOISE] applied:", applied)
 
     return out, applied

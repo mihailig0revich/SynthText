@@ -3128,7 +3128,7 @@ class   RendererV3(object):
             H_img, W_img = img.shape[:2]
             debug = bool(getattr(self, "debug_hgeom", False))
 
-            # ✅ NEW: если выключены все аугментации — не делаем синтетическую окклюзию
+            # ✅ master-switch: если True — НЕ делаем синтетическую окклюзию (перекрытия)
             disable_all_augs = bool(getattr(self, "disable_all_augs", False))
 
             dst_quad = self._overlay_resolve_target_quad(region_coords)
@@ -3267,7 +3267,7 @@ class   RendererV3(object):
                 rgb_loc, a_loc, fill=fill, thr=8, allow_upscale=True, max_up=max_up
             )
 
-            # warp to image
+            # warp text to image
             warped_rgb, warped_a_full = self._overlay_warp_rgba_to_image(rgb_loc, a_loc, dst_quad, (H_img, W_img))
             if warped_rgb is None or warped_a_full is None:
                 return None, None, None
@@ -3280,7 +3280,7 @@ class   RendererV3(object):
             alpha_thr = int(getattr(self, "overlay_alpha_thr", 2))
             alpha_thr = max(1, alpha_thr)
 
-            # FULL mask (для GT/charBB при желании)
+            # FULL mask
             text_mask_full = ((warped_a_full > alpha_thr).astype(np.uint8) * 255)
             if int(text_mask_full.sum()) == 0:
                 text_mask_full = ((warped_a_full > 1).astype(np.uint8) * 255)
@@ -3289,11 +3289,11 @@ class   RendererV3(object):
                         print("[OVERLAY] warped mask empty (full)")
                     return None, None, None
 
-            # --- synthetic controlled occlusion ---
+            # --- synthetic controlled occlusion (перекрытие) ---
             warped_a_vis = warped_a_full
             occ_mask_u8 = None
 
-            # ✅ NEW: окклюзию делаем только если disable_all_augs == False
+            # ✅ если disable_all_augs=True — окклюзию не применяем
             if not disable_all_augs:
                 try:
                     warped_rgb, warped_a_vis, _occ_rgb_unused, occ_mask_u8 = self._overlay_apply_synth_occlusion(
@@ -3319,14 +3319,81 @@ class   RendererV3(object):
                         print("[OVERLAY] warped mask empty (out)")
                     return None, None, None
 
-            # --- background rectangle ---
-            # True  -> фон под текстом только там, где текст ВИДИМ (после окклюзии)
-            # False -> фон под текстом по ПОЛНОЙ альфе (чтобы окклюзия не "выбивалась" цветом)
-            use_visible_alpha_for_bg = bool(getattr(self, "overlay_bg_use_visible_alpha", False))
-            bg_alpha = warped_a_vis if use_visible_alpha_for_bg else warped_a_full
+            # --- background UNDER text ---
+            # ✅ перспективная СПЛОШНАЯ ПЛАШКА (bbox текста в локалке -> warp тем же dst_quad)
+            use_persp_bg = bool(getattr(self, "overlay_bg_perspective", True))
 
             bg_thr = int(getattr(self, "overlay_bg_alpha_thr", max(10, alpha_thr * 4)))
-            img_bg = self._overlay_apply_bg_rect_imgspace(img, bg_alpha, pad_px=16, alpha_thr=bg_thr)
+            bg_thr = max(1, bg_thr)
+
+            img_bg = img
+
+            if use_persp_bg:
+                thr_loc = int(getattr(self, "overlay_bg_loc_thr", 8))
+                m_loc = (a_loc > thr_loc)
+
+                if m_loc.any():
+                    ys, xs = np.where(m_loc)
+                    x0l, x1l = int(xs.min()), int(xs.max())
+                    y0l, y1l = int(ys.min()), int(ys.max())
+
+                    pad_px = int(getattr(self, "overlay_bg_pad_px", 18))
+                    pad_px = max(0, min(200, pad_px))
+
+                    x0l = max(0, x0l - pad_px)
+                    y0l = max(0, y0l - pad_px)
+                    x1l = min(a_loc.shape[1] - 1, x1l + pad_px)
+                    y1l = min(a_loc.shape[0] - 1, y1l + pad_px)
+
+                    bg_a_loc = np.zeros_like(a_loc, dtype=np.uint8)
+                    bg_a_loc[y0l:y1l + 1, x0l:x1l + 1] = 255
+
+                    feather = float(getattr(self, "overlay_bg_feather_sigma", 2.0))
+                    feather = max(0.0, min(20.0, feather))
+                    if feather > 1e-6:
+                        bg_a_loc = cv2.GaussianBlur(bg_a_loc, (0, 0), sigmaX=feather, sigmaY=feather)
+
+                    opacity = float(getattr(self, "overlay_bg_opacity", 1.0))
+                    opacity = max(0.0, min(1.0, opacity))
+                    if opacity < 0.999:
+                        bg_a_loc = np.clip(bg_a_loc.astype(np.float32) * opacity, 0, 255).astype(np.uint8)
+
+                    # цвет плашки = mean под quad в исходной сцене (стабильно)
+                    poly = np.round(dst_quad).astype(np.int32)
+                    poly[:, 0] = np.clip(poly[:, 0], 0, W_img - 1)
+                    poly[:, 1] = np.clip(poly[:, 1], 0, H_img - 1)
+                    poly_mask = np.zeros((H_img, W_img), dtype=np.uint8)
+                    cv2.fillConvexPoly(poly_mask, poly, 255)
+                    mean = cv2.mean(img, mask=poly_mask)[:3]
+                    bg = tuple(int(np.clip(round(v), 0, 255)) for v in mean)
+
+                    bg_rgb_loc = np.zeros_like(rgb_loc, dtype=np.uint8)
+                    bg_rgb_loc[:, :] = bg
+
+                    # warp плашки: RGB linear, ALPHA linear (чтобы feather не убивался NEAREST)
+                    h, w = bg_a_loc.shape[:2]
+                    src = np.array([[0, 0], [w - 1, 0], [w - 1, h - 1], [0, h - 1]], dtype=np.float32)
+                    dst = dst_quad.astype(np.float32)
+                    Mbg = cv2.getPerspectiveTransform(src, dst)
+
+                    warped_bg_rgb = cv2.warpPerspective(
+                        bg_rgb_loc, Mbg, (W_img, H_img),
+                        flags=cv2.INTER_LINEAR,
+                        borderMode=cv2.BORDER_CONSTANT, borderValue=(0, 0, 0)
+                    )
+                    warped_bg_a = cv2.warpPerspective(
+                        bg_a_loc, Mbg, (W_img, H_img),
+                        flags=cv2.INTER_LINEAR,
+                        borderMode=cv2.BORDER_CONSTANT, borderValue=0
+                    )
+                    warped_bg_a = np.clip(warped_bg_a, 0, 255).astype(np.uint8)
+
+                    img_bg = self._overlay_alpha_blend(img, warped_bg_rgb, warped_bg_a)
+                else:
+                    # fallback: старый bbox-rect в image-space
+                    img_bg = self._overlay_apply_bg_rect_imgspace(img, warped_a_full, pad_px=16, alpha_thr=bg_thr)
+            else:
+                img_bg = self._overlay_apply_bg_rect_imgspace(img, warped_a_full, pad_px=16, alpha_thr=bg_thr)
 
             # blend text (используем альфу ПОСЛЕ окклюзии)
             img_new = self._overlay_alpha_blend(img_bg, warped_rgb, warped_a_vis)
@@ -3364,8 +3431,6 @@ class   RendererV3(object):
             print("[OVERLAY] UNHANDLED EXCEPTION:", repr(e))
             traceback.print_exc()
             return None, None, None
-
-
 
 
     def get_num_text_regions(self, nregions: int) -> int:
