@@ -1,73 +1,226 @@
 # SynthText
-Code for generating synthetic text images as described in ["Synthetic Data for Text Localisation in Natural Images", Ankush Gupta, Andrea Vedaldi, Andrew Zisserman, CVPR 2016](http://www.robots.ox.ac.uk/~vgg/data/scenetext/).
 
+Проект генерирует синтетические изображения с текстом на реальных сценах по идее из статьи
+["Synthetic Data for Text Localisation in Natural Images", Ankush Gupta, Andrea Vedaldi, Andrew Zisserman, CVPR 2016](http://www.robots.ox.ac.uk/~vgg/data/scenetext/).
 
-**Synthetic Scene-Text Image Samples**
+Текущая версия проекта переведена на Python 3, разложена по пакету `synthtext/` и содержит CLI, простой GUI, диагностику RANSAC/placement и режим визуализации.
+
 ![Synthetic Scene-Text Samples](samples.png "Synthetic Samples")
 
-The code in the `master` branch is for Python2. Python3 is supported in the `python3` branch.
+## Что Нужно Для Работы
 
-The main dependencies are:
+Основные зависимости:
 
-```
-pygame, opencv (cv2), PIL (Image), numpy, matplotlib, h5py, scipy
-```
-
-### Generating samples
-
-```
-python gen.py --viz
+```text
+pygame, opencv-python, pillow, numpy, matplotlib, h5py, scipy
 ```
 
-This will download a data file (~56M) to the `data` directory. This data file includes:
+Если используется локальное виртуальное окружение:
 
-  - **dset.h5**: This is a sample h5 file which contains a set of 5 images along with their depth and segmentation information. Note, this is just given as an example; you are encouraged to add more images (along with their depth and segmentation information) to this database for your own use.
-  - **data/fonts**: three sample fonts (add more fonts to this folder and then update `fonts/fontlist.txt` with their paths).
-  - **data/newsgroup**: Text-source (from the News Group dataset). This can be subsituted with any text file. Look inside `text_utils.py` to see how the text inside this file is used by the renderer.
-  - **data/models/colors_new.cp**: Color-model (foreground/background text color model), learnt from the IIIT-5K word dataset.
-  - **data/models**: Other cPickle files (**char\_freq.cp**: frequency of each character in the text dataset; **font\_px2pt.cp**: conversion from pt to px for various fonts: If you add a new font, make sure that the corresponding model is present in this file, if not you can add it by adapting `invert_font_size.py`).
-
-This script will generate random scene-text image samples and store them in an h5 file in `results/SynthText.h5`. If the `--viz` option is specified, the generated output will be visualized as the script is being run; omit the `--viz` option to turn-off the visualizations. If you want to visualize the results stored in  `results/SynthText.h5` later, run:
-
+```bash
+python3 -m venv .venv
+.venv/bin/pip install -r requirements.txt
 ```
-python visualize_results.py
+
+Входные данные должны лежать в `.h5`-файлах и содержать изображения, depth map и segmentation. По умолчанию приложение ищет файлы в папке `input/`.
+
+## Быстрый Запуск
+
+Запуск через командную строку:
+
+```bash
+.venv/bin/python gen.py --input-dir input --num-img 10
 ```
-### Pre-generated Dataset
-A dataset with approximately 800000 synthetic scene-text images generated with this code can be found [here](http://www.robots.ox.ac.uk/~vgg/data/scenetext/).
 
-### Adding New Images
-Segmentation and depth-maps are required to use new images as background. Sample scripts for obtaining these are available [here](https://github.com/ankush-me/SynthText/tree/master/prep_scripts).
+Запуск с визуализацией:
 
-* `predict_depth.m` MATLAB script to regress a depth mask for a given RGB image; uses the network of [Liu etal.](https://bitbucket.org/fayao/dcnf-fcsp/) However, more recent works (e.g., [this](https://github.com/iro-cp/FCRN-DepthPrediction)) might give better results.
-* `run_ucm.m` and `floodFill.py` for getting segmentation masks using [gPb-UCM](https://github.com/jponttuset/mcg).
+```bash
+.venv/bin/python gen.py --input-dir input --num-img 10 --viz
+```
 
-For an explanation of the fields in `dset.h5` (e.g.: `seg`,`area`,`label`), please check this [comment](https://github.com/ankush-me/SynthText/issues/5#issuecomment-274490044).
+Запуск GUI:
 
-### Pre-processed Background Images
-The 8,000 background images used in the paper, along with their segmentation and depth masks, have been uploaded here:
-`http://www.robots.ox.ac.uk/~vgg/data/scenetext/preproc/<filename>`, where, `<filename>` can be:
+```bash
+.venv/bin/python gui.py
+```
 
-|    filenames    | size |                      description                     |             md5 hash             |
-|:--------------- | ----:|:---------------------------------------------------- |:-------------------------------- |
-| `imnames.cp`    | 180K | names of images which do not contain background text |                                  |
-| `bg_img.tar.gz` | 8.9G | images (filter these using `imnames.cp`)             | 3eac26af5f731792c9d95838a23b5047 |
-| `depth.h5`      |  15G | depth maps                                           | af97f6e6c9651af4efb7b1ff12a5dc1b |
-| `seg.h5`        | 6.9G | segmentation maps                                    | 1605f6e629b2524a3902a5ea729e86b2 |
+Результат по умолчанию сохраняется в:
 
-Note: due to large size, `depth.h5` is also available for download as 3-part split-files of 5G each.
-These part files are named: `depth.h5-00, depth.h5-01, depth.h5-02`. Download using the path above, and put them together using `cat depth.h5-0* > depth.h5`.
+- `results/SynthText.h5` - основной HDF5 с изображениями, `charBB`, `wordBB`, `txt`, `lang`.
+- `results_png/` - папка для PNG-вывода, если он используется в пайплайне.
 
-[`use_preproc_bg.py`](https://github.com/ankush-me/SynthText/blob/master/use_preproc_bg.py) provides sample code for reading this data.
+## GUI
 
-Note: I do not own the copyright to these images.
+GUI находится в `synthtext/gui.py`, а запускать его удобнее через корневой файл:
 
-### Generating Samples with Text in non-Latin (English) Scripts
-- @JarveeLee has modified the pipeline for generating samples with Chinese text [here](https://github.com/JarveeLee/SynthText_Chinese_version).
-- @adavoudi has modified it for arabic/persian script, which flows from right-to-left [here](https://github.com/adavoudi/SynthText).
-- @MichalBusta has adapted it for a number of languages (e.g. Bangla, Arabic, Chinese, Japanese, Korean) [here](https://github.com/MichalBusta/E2E-MLT).
-- @gachiemchiep has adapted for Japanese [here](https://github.com/gachiemchiep/SynthText).
-- @gungui98 has adapted for Vietnamese [here](https://github.com/gungui98/SynthText).
-- @youngkyung has adapted for Korean [here](https://github.com/youngkyung/SynthText_kr).
+```bash
+.venv/bin/python gui.py
+```
 
-### Further Information
-Please refer to the paper for more information, or contact me (email address in the paper).
+Окно GUI позволяет:
+
+- выбрать входную папку с `.h5`;
+- указать fallback `.h5`;
+- выбрать папку `data/` с моделями, шрифтами и текстовыми источниками;
+- задать выходной HDF5 и папку PNG;
+- настроить количество изображений, попытки, таймауты и число workers;
+- включить `--viz`, `--ransac-debug`, `--placement-debug`, `--debug-progress`;
+- запустить/остановить генерацию;
+- смотреть live-лог процесса;
+- в режиме `--viz` переходить к следующему изображению кнопкой `Continue viz` или завершать просмотр через `Quit viz`.
+
+GUI не содержит отдельной логики генерации: он собирает и запускает обычную команду `gen.py` с выбранными флагами. Это удобно, потому что CLI и GUI проверяют один и тот же пайплайн.
+
+## Основные Флаги CLI
+
+Полный список можно посмотреть так:
+
+```bash
+.venv/bin/python gen.py --help
+```
+
+| Флаг | По умолчанию | Описание |
+| --- | --- | --- |
+| `--input-dir PATH` | `input` | Папка с входными `.h5`-файлами. |
+| `--fallback-h5 PATH` | `street/bg_data/bg_data.h5` | Резервный `.h5`, если во входной папке ничего не найдено. |
+| `--render-data-path PATH` | `data` | Папка с моделями, шрифтами и текстовыми источниками. |
+| `--output-file PATH` | `results/SynthText.h5` | Базовый путь выходного HDF5. |
+| `--png-dir PATH` | `results_png` | Папка для PNG-вывода. |
+| `--num-img N` | `-1` | Сколько изображений брать из каждого входного файла. `-1` означает все. |
+| `--instances-per-image N` | `1` | Сколько текстовых инстансов пытаться разместить на одном изображении. |
+| `--secs-per-img N` | `5` | Лимит времени на рендер одного изображения. |
+| `--max-global-tries N` | `8` | Максимальное число повторных попыток для изображения. |
+| `--max-h5-size-gb N` | `10.0` | Максимальный размер одного выходного HDF5 перед переключением на следующий файл. |
+| `--region-workers N` | `1` | Число потоков для независимого RANSAC/plane fitting по candidate-регионам. `1` сохраняет последовательный режим. |
+| `--viz` | выключен | Показывает визуализацию во время генерации. |
+| `--interactive` | выключен | При запуске спрашивает путь к входной папке. |
+| `--ransac-debug` | выключен | Печатает подробную диагностику RANSAC. |
+| `--ransac-stats N` | `0` | Отдельный режим статистики по первым `N` изображениям. Не рендерит текст и не пишет выходной HDF5. |
+| `--placement-debug` | выключен | Печатает причины отказов на этапе placement/overlay. |
+| `--debug-progress` | выключен | Печатает прогресс по файлам, изображениям и попыткам. Автоматически включается для `--ransac-stats`, `--ransac-debug`, `--placement-debug`. |
+
+## Примеры Запуска
+
+Сгенерировать 100 изображений:
+
+```bash
+.venv/bin/python gen.py --input-dir input --num-img 100
+```
+
+Запустить с визуализацией и ручным переходом между примерами:
+
+```bash
+.venv/bin/python gen.py --input-dir input --num-img 20 --viz
+```
+
+Ускорить проверку независимых регионов:
+
+```bash
+.venv/bin/python gen.py --input-dir input --num-img 100 --region-workers 4
+```
+
+Собрать статистику отказов RANSAC/placement на 1000 изображениях:
+
+```bash
+.venv/bin/python gen.py --input-dir input --ransac-stats 1000
+```
+
+Включить подробный debug:
+
+```bash
+.venv/bin/python gen.py --input-dir input --num-img 20 --ransac-debug --placement-debug
+```
+
+## Режим RANSAC-Статистики
+
+Флаг `--ransac-stats N` запускает отдельный диагностический режим. Он проходит первые `N` изображений, проверяет регионы, depth, RANSAC и placement-mask, после чего печатает сводку:
+
+- сколько изображений прошло успешно;
+- сколько было отказов из-за отсутствия raw/shape/depth/placement регионов;
+- какие события чаще всего встречались в region filtering;
+- какие события чаще всего встречались в placement;
+- список худших изображений для ручного анализа.
+
+Этот режим не создаёт renderer, не накладывает текст и не записывает `results/SynthText.h5`.
+
+## Визуализация
+
+При `--viz` приложение показывает промежуточные и финальные изображения. После каждого изображения процесс ждёт ввода:
+
+- `Enter` - перейти к следующему изображению;
+- `q` - остановить визуализацию.
+
+В GUI для этого есть кнопки:
+
+- `Continue viz`;
+- `Quit viz`.
+
+Для просмотра уже сохранённого HDF5:
+
+```bash
+.venv/bin/python -m synthtext.tools.visualize_results
+```
+
+## Структура Проекта
+
+Основная реализация находится внутри `synthtext/`:
+
+```text
+synthtext/
+  cli.py              # CLI-флаги и запуск пайплайна
+  config.py           # GenerationConfig
+  pipeline.py         # основной цикл генерации
+  h5_io.py            # чтение входных H5 и запись результата
+  gui.py              # Tkinter GUI
+  debug_viz.py        # функции визуализации
+  ransac_stats.py     # диагностический режим RANSAC/placement
+  rendering/
+    renderer.py       # RendererV3
+    overlay.py        # overlay/compositing helper-методы
+    text_service.py   # явный мост renderer -> text_utils
+    text_utils.py     # шрифты, текстовые источники, bitmap masks
+    colorize.py       # цвет, shadow, border, blending
+    poisson.py        # poisson blending helpers
+  spatial/
+    regions.py        # поиск и фильтрация областей
+    geometry.py       # homography/geometry helpers
+    ransac.py         # fit_plane_ransac
+    synth_utils.py    # depth/camera/plane utilities
+  augmentation/
+    noise.py          # шумы и деградации изображения
+    extra.py          # дополнительные аугментации
+    transforms.py     # базовые transform helpers
+  tools/
+    visualize_results.py
+    invert_font_size.py
+```
+
+В корне оставлены только пользовательские точки запуска `gen.py` и `gui.py`. Старые compatibility wrappers вроде `synthgen.py`, `text_utils.py`, `ransac.py` удалены. Для импортов используйте новые пути, например:
+
+```python
+from synthtext.rendering.renderer import RendererV3
+from synthtext.rendering.text_utils import RenderFont
+from synthtext.spatial.regions import TextRegions
+from synthtext.spatial.ransac import fit_plane_ransac
+from synthtext.rendering.colorize import Colorize
+```
+
+## Данные
+
+Папка `data/` обычно содержит:
+
+- `data/fonts` - шрифты и `fontlist.txt`;
+- `data/newsgroup` - текстовые источники;
+- `data/models/colors_new.cp` - модель цветов текста;
+- `data/models/char_freq.cp` - частоты символов;
+- `data/models/font_px2pt.cp` - соответствие высоты шрифта в px и pt.
+
+Входные `.h5` должны содержать совместимые группы изображений, depth и segmentation. Пайплайн автоматически пытается найти группы с типичными именами вроде `img`, `depth`, `seg`.
+
+## Дополнительная Информация
+
+Оригинальный предобработанный набор фонов SynthText описан на странице проекта VGG:
+
+`http://www.robots.ox.ac.uk/~vgg/data/scenetext/preproc/<filename>`
+
+Для подробной навигации по классам и методам см. `CODE_REFERENCE.md`.

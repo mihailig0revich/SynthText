@@ -1,33 +1,16 @@
-from __future__ import division
-import numpy as np
-import matplotlib.pyplot as plt 
-import scipy.io as sio
+import io
+import os
 import os.path as osp
-import random, os
+import random
+
 import cv2
-#import cPickle as cp
-import _pickle as cp
-import scipy.signal as ssig
-import scipy.stats as sstat
-import pygame, pygame.locals
-from pygame import freetype
-#import Image
-from PIL import Image
-import math
-from common import *
-import pickle
-import numpy as np
 import matplotlib.pyplot as plt
 import numpy as np
-import cv2
+import pickle
+import scipy.stats as sstat
 
-import cv2
-import numpy as np
-import os
-
-import cv2
-import numpy as np
-import os
+import pygame, pygame.locals
+from pygame import freetype
 
 
 # Совместимость со старым кодом на NumPy 2.x
@@ -38,16 +21,15 @@ if not hasattr(np, "int"):
 if not hasattr(np, "bool"):
     np.bool = bool
 
-import io
+DEFAULT_ENCODINGS = ("utf-8", "cp1251", "latin-1")
 
-def read_lines_any_encoding(path, attempts=('utf-8', 'cp1251', 'latin-1')):
-    last_err = None
+
+def read_lines_any_encoding(path, attempts=DEFAULT_ENCODINGS):
     for enc in attempts:
         try:
             with io.open(path, 'r', encoding=enc, errors='strict') as f:
                 return [l.strip() for l in f]
-        except UnicodeDecodeError as e:
-            last_err = e
+        except UnicodeDecodeError:
             continue
     # последний шанс: «мягко» проглотить редкие символы
     with io.open(path, 'r', encoding=attempts[0], errors='replace') as f:
@@ -61,6 +43,93 @@ def sample_weighted(p_dict):
     else:
         ps = ps / ps.sum()
     return np.random.choice(ks, p=ps)
+
+
+def _normalize_text_lines(text):
+    if isinstance(text, list):
+        return [str(ln) for ln in text]
+    return str(text).split("\n")
+
+
+def _get_pil_font(font, size=None):
+    from PIL import ImageFont
+
+    pil_font = getattr(font, "pil_font", None)
+    if pil_font is not None:
+        return pil_font
+
+    font_path = getattr(font, "path")
+    font_size = int(size if size is not None else getattr(font, "size", 16))
+    return ImageFont.truetype(font_path, size=font_size)
+
+
+def _get_font_metrics(pil_font, base_size):
+    try:
+        return pil_font.getmetrics()
+    except Exception:
+        return base_size, int(0.25 * base_size)
+
+
+def _glyph_bbox(pil_font, ch, fallback_size):
+    try:
+        l, t, r, b = pil_font.getbbox(ch)
+        return int(l), int(t), int(r), int(b)
+    except Exception:
+        mask = pil_font.getmask(ch, mode="L")
+        w, h = (mask.size if hasattr(mask, "size") else (fallback_size, fallback_size))
+        return 0, 0, int(w), int(h)
+
+
+def _binarize_text_mask(txt_arr):
+    if not txt_arr.size:
+        return txt_arr
+    _, txt_bin = cv2.threshold(txt_arr, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    return txt_bin
+
+
+def _apply_text_stroke(txt_bin, stroke, stroke_mode):
+    if stroke <= 0 or not txt_bin.size or stroke_mode == "none":
+        return txt_bin
+
+    k = 2 * int(stroke) + 1
+    kern = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
+
+    if stroke_mode == "dilate":
+        return cv2.dilate(txt_bin, kern, iterations=1)
+
+    edge = cv2.morphologyEx(txt_bin, cv2.MORPH_GRADIENT, kern)
+    edge = cv2.dilate(edge, kern, iterations=1)
+    return cv2.bitwise_or(txt_bin, edge)
+
+
+def _resize_text_width(txt_bin, bb_list, widen):
+    widen = float(np.clip(float(widen), 0.7, 1.6))
+    if not txt_bin.size or abs(widen - 1.0) <= 1e-3:
+        return txt_bin, bb_list
+
+    H, W = txt_bin.shape[:2]
+    newW = max(1, int(round(W * widen)))
+    txt_bin = cv2.resize(txt_bin, (newW, H), interpolation=cv2.INTER_NEAREST)
+
+    for i in range(len(bb_list)):
+        bb_list[i][0] = int(round(bb_list[i][0] * widen))
+        bb_list[i][2] = max(1, int(round(bb_list[i][2] * widen)))
+
+    return txt_bin, bb_list
+
+
+def _load_latin1_pickle(path):
+    with open(path, 'rb') as f:
+        u = pickle._Unpickler(f)
+        u.encoding = 'latin1'
+        return u.load()
+
+
+def _normalize_probabilities(keys, weights):
+    ps = np.array([float(weights.get(k, 0.0)) for k in keys], dtype=np.float64)
+    if not np.isfinite(ps).all() or ps.sum() <= 0:
+        return np.ones(len(keys), dtype=np.float64) / float(len(keys))
+    return ps / ps.sum()
 
 
 
@@ -309,62 +378,6 @@ class RenderFont(object):
 
         return alpha_c, words, bbs_c
 
-    
-    def render_sample(self, font, mask):
-        """
-        Places text in the "collision-free" region as indicated
-        in the mask -- 255 for unsafe, 0 for safe.
-        The text is rendered using FONT, the text content is TEXT.
-        """
-        H, W = self.robust_HW(mask)
-        f_asp = self.font_state.get_aspect_ratio(font)
-
-        max_font_h = H  # Устанавливаем высоту шрифта равной высоте изображения
-
-        i = 0
-        while i < self.max_shrink_trials and max_font_h > self.min_font_h:
-            f_h_px = self.sample_font_height_px(self.min_font_h, max_font_h)
-            f_h = self.font_state.get_font_size(font, f_h_px)
-
-            max_font_h = f_h_px
-            i += 1
-
-            font.size = f_h  # Устанавливаем размер шрифта
-
-            # Убираем ограничение на количество символов
-            nchar = 100  # Временно устанавливаем фиксированное значение для количества символов
-
-            text_type = sample_weighted(self.p_text)
-            text = self.text_source.sample(nline, nchar, text_type)
-            if len(text) == 0 or np.any([len(line) == 0 for line in text]):
-                continue
-
-            # Рендерим текст с фоном
-            background_color = (255, 255, 255)  # Белый фон
-            alpha = 0.5  # Прозрачность фона
-            text_with_background = self.render_with_background(font, text, background_color, alpha)
-
-            # НЕ ПРОВЕРЯЕМ, выходит ли текст за пределы изображения
-            # Просто пропускаем, если текст не помещается в маску
-            txt_arr, txt, bb = self.render_curved(font, text)
-            bb = self.bb_xywh2coords(bb)
-
-            # Размещение текста с фоном внутри маски:
-            text_mask, loc, bb, _ = self.place_text([text_with_background], mask, [bb])
-
-            if len(loc) == 0:
-                continue
-
-            text_mask = (text_mask > 0).astype(np.uint8) * 255
-
-            if len(loc) > 0:  # Если успешно разместили текст без столкновений:
-
-                return text_mask, loc[0], bb[0], text
-
-        return None  # Если не удалось разместить текст
-
-# --- ВНУТРИ class RenderFont(object): ---
-
     def get_glyph_advance(self, font, ch):
         """
         Возвращает горизонтальный advance для символа ch в пикселях.
@@ -393,7 +406,111 @@ class RenderFont(object):
         ar = max(0.4, ar)
         return max(1, int(round(ar * float(getattr(font, "size", 16)))))
 
-    # --- ВНУТРИ class RenderFont(object): ---
+    def _split_line_chars(self, lines):
+        per_line_chars = []
+        per_line_wbflags = []
+
+        for ln in lines:
+            chars, wb = [], []
+            prev_space = True
+            for ch in str(ln):
+                if ch.isspace():
+                    prev_space = True
+                    continue
+                chars.append(ch)
+                wb.append(bool(prev_space))
+                prev_space = False
+            per_line_chars.append(chars)
+            per_line_wbflags.append(wb)
+
+        return per_line_chars, per_line_wbflags
+
+    def _measure_text_lines(self, font, pil_font, per_line_chars, per_line_wbflags,
+                            base_size, safe_line_h, char_gap_px, word_gap_px):
+        char_gap_rel = float(getattr(self, "char_gap_rel", 0.0))
+        char_gap_rel = float(np.clip(char_gap_rel, -0.10, 0.35))
+
+        line_advances = []
+        line_glyph_bboxes = []
+        line_widths = []
+        line_heights = []
+
+        for chars, wbflags in zip(per_line_chars, per_line_wbflags):
+            advances = []
+            glyph_bboxes = []
+
+            for ch in chars:
+                l, t, r, b = _glyph_bbox(pil_font, ch, base_size)
+                gw = max(1, int(r - l))
+                glyph_bboxes.append((l, t, r, b))
+
+                try:
+                    adv_base = float(self.get_glyph_advance(font, ch))
+                except Exception:
+                    adv_base = float(gw)
+
+                adv = adv_base * (1.0 + char_gap_rel) + float(char_gap_px)
+                adv = max(adv, float(gw + 1))
+                advances.append(max(1, int(round(adv))))
+
+            if glyph_bboxes:
+                min_left = min(bb[0] for bb in glyph_bboxes)
+                line_w = max(0, -min_left)
+                for j, adv in enumerate(advances):
+                    if j > 0 and wbflags[j]:
+                        line_w += int(word_gap_px)
+                    line_w += int(adv)
+            else:
+                line_w = 0
+
+            line_advances.append(advances)
+            line_glyph_bboxes.append(glyph_bboxes)
+            line_widths.append(int(line_w))
+            line_heights.append(int(safe_line_h))
+
+        return line_advances, line_glyph_bboxes, line_widths, line_heights
+
+    def _render_text_layout(self, draw, pil_font, per_line_chars, per_line_wbflags,
+                            line_advances, line_glyph_bboxes, line_heights,
+                            fp_pad_px, line_gap_px, word_gap_px):
+        bb_list = []
+        y_cursor = int(fp_pad_px)
+
+        for line_idx, (chars, wbflags, advances, glyph_bboxes) in enumerate(
+            zip(per_line_chars, per_line_wbflags, line_advances, line_glyph_bboxes)
+        ):
+            x_cursor = int(fp_pad_px)
+            line_h = int(line_heights[line_idx])
+
+            if glyph_bboxes:
+                min_left = min(bb[0] for bb in glyph_bboxes)
+                min_top = min(bb[1] for bb in glyph_bboxes)
+            else:
+                min_left, min_top = 0, 0
+
+            base_x_shift = max(0, -int(min_left))
+            base_y_shift = max(0, -int(min_top))
+
+            for j, (ch, adv, (l, t, r, _b)) in enumerate(zip(chars, advances, glyph_bboxes)):
+                if j > 0 and wbflags[j]:
+                    x_cursor += int(word_gap_px)
+
+                gw = max(1, int(r - l))
+                glyph_x0 = int(x_cursor + base_x_shift)
+                glyph_y0 = int(y_cursor + base_y_shift)
+
+                draw_x = int(glyph_x0 - l)
+                draw_y = int(glyph_y0 - t)
+                draw.text((draw_x, draw_y), ch, fill=255, font=pil_font)
+
+                bb_list.append([int(glyph_x0), int(y_cursor), int(gw), int(max(1, line_h))])
+                x_cursor += int(adv)
+
+            y_cursor += int(line_h)
+            if line_idx + 1 < len(line_heights):
+                y_cursor += int(line_gap_px)
+
+        return bb_list
 
     def render_curved(self, font, text,
                     char_gap_px=None, word_gap_px=None,
@@ -411,9 +528,7 @@ class RenderFont(object):
         - Гарантия: advance >= ширина глифа + 1 (буквы не налезают).
         - "Ширина текста" регулируется char_gap_rel / char_gap_px, а при желании ещё text_widen_scale.
         """
-        import numpy as np
-        import cv2
-        from PIL import Image, ImageDraw, ImageFont
+        from PIL import Image, ImageDraw
 
         if char_gap_px is None:
             char_gap_px = int(getattr(self, "char_gap_px", 0))
@@ -422,103 +537,24 @@ class RenderFont(object):
         if line_gap_px is None:
             line_gap_px = 4
 
-        # линии
-        if isinstance(text, list):
-            lines = [str(ln) for ln in text]
-        else:
-            lines = str(text).split("\n")
-
-        # PIL font
-        pil_font = getattr(font, "pil_font", None)
-        if pil_font is None:
-            pil_font = ImageFont.truetype(getattr(font, "path"), size=int(getattr(font, "size", 16)))
-
+        lines = _normalize_text_lines(text)
         base_size = int(getattr(font, "size", 16))
-
-        # метрики строки
-        try:
-            ascent, descent = pil_font.getmetrics()
-        except Exception:
-            ascent, descent = base_size, int(0.25 * base_size)
-
+        pil_font = _get_pil_font(font, size=base_size)
+        ascent, descent = _get_font_metrics(pil_font, base_size)
         line_extra = int(0.25 * base_size)
         safe_line_h = int(ascent + descent + line_extra)
 
-        # разбор строк: символы + флаг "начало слова"
-        per_line_chars = []
-        per_line_wbflags = []
-        for ln in lines:
-            ln = str(ln)
-            chars, wb = [], []
-            prev_space = True
-            for ch in ln:
-                if ch.isspace():
-                    prev_space = True
-                    continue
-                chars.append(ch)
-                wb.append(bool(prev_space))
-                prev_space = False
-            per_line_chars.append(chars)
-            per_line_wbflags.append(wb)
-
-        # относительный трекинг
-        char_gap_rel = float(getattr(self, "char_gap_rel", 0.0))
-        char_gap_rel = float(np.clip(char_gap_rel, -0.10, 0.35))
-
-        # собираем advances и bbox-ы глифов
-        line_advances = []
-        line_glyph_bboxes = []
-        line_widths = []
-        line_heights = []
-
-        for chars, wbflags in zip(per_line_chars, per_line_wbflags):
-            advances = []
-            glyph_bboxes = []
-
-            for ch in chars:
-                try:
-                    l, t, r, b = pil_font.getbbox(ch)
-                except Exception:
-                    mask = pil_font.getmask(ch, mode="L")
-                    w, h = (mask.size if hasattr(mask, "size") else (base_size, base_size))
-                    l, t, r, b = 0, 0, int(w), int(h)
-
-                l, t, r, b = int(l), int(t), int(r), int(b)
-                gw = max(1, int(r - l))
-                glyph_bboxes.append((l, t, r, b))
-
-                # базовый advance
-                try:
-                    adv_base = float(self.get_glyph_advance(font, ch))
-                except Exception:
-                    adv_base = float(gw)
-
-                adv = adv_base * (1.0 + char_gap_rel) + float(char_gap_px)
-
-                # ✅ КРИТИЧНО: не даём следующей букве налезть на текущую
-                adv = max(adv, float(gw + 1))
-
-                adv = max(1, int(round(adv)))
-                advances.append(adv)
-
-            # ширина строки с учётом word_gap_px
-            if glyph_bboxes:
-                min_left = min(bb[0] for bb in glyph_bboxes)
-                left_comp = max(0, -min_left)
-
-                wsum = int(left_comp)
-                for j, adv in enumerate(advances):
-                    if j > 0 and wbflags[j]:
-                        wsum += int(word_gap_px)
-                    wsum += int(adv)
-                line_w = int(wsum)
-            else:
-                line_w = 0
-
-            line_advances.append(advances)
-            line_glyph_bboxes.append(glyph_bboxes)
-            line_widths.append(line_w)
-            line_heights.append(int(safe_line_h))
+        per_line_chars, per_line_wbflags = self._split_line_chars(lines)
+        line_advances, line_glyph_bboxes, line_widths, line_heights = self._measure_text_lines(
+            font,
+            pil_font,
+            per_line_chars,
+            per_line_wbflags,
+            base_size,
+            safe_line_h,
+            char_gap_px,
+            word_gap_px,
+        )
 
         # канва
         max_line_w = max(line_widths) if line_widths else 1
@@ -533,59 +569,21 @@ class RenderFont(object):
 
         canvas = Image.new("L", (total_w, total_h), 0)
         draw = ImageDraw.Draw(canvas)
+        bb_list = self._render_text_layout(
+            draw,
+            pil_font,
+            per_line_chars,
+            per_line_wbflags,
+            line_advances,
+            line_glyph_bboxes,
+            line_heights,
+            fp_pad_px,
+            line_gap_px,
+            word_gap_px,
+        )
 
-        # рендер + bbox
-        bb_list = []
-        y_cursor = int(fp_pad_px)
-
-        for line_idx, (chars, wbflags, advances, glyph_bboxes) in enumerate(
-            zip(per_line_chars, per_line_wbflags, line_advances, line_glyph_bboxes)
-        ):
-            x_cursor = int(fp_pad_px)
-            line_h = int(line_heights[line_idx])
-
-            if glyph_bboxes:
-                min_left = min(bb[0] for bb in glyph_bboxes)
-                min_top  = min(bb[1] for bb in glyph_bboxes)
-            else:
-                min_left, min_top = 0, 0
-
-            base_x_shift = max(0, -int(min_left))
-            base_y_shift = max(0, -int(min_top))
-
-            for j, (ch, adv, (l, t, r, b)) in enumerate(zip(chars, advances, glyph_bboxes)):
-                if j > 0 and wbflags[j]:
-                    x_cursor += int(word_gap_px)
-
-                gw = max(1, int(r - l))
-
-                # хотим, чтобы bbox глифа начинался в (x_cursor + base_x_shift)
-                glyph_x0 = int(x_cursor + base_x_shift)
-                glyph_y0 = int(y_cursor + base_y_shift)
-
-                # позиция рисования (компенсируем l,t)
-                draw_x = int(glyph_x0 - l)
-                draw_y = int(glyph_y0 - t)
-
-                draw.text((draw_x, draw_y), ch, fill=255, font=pil_font)
-
-                # bbox на всю высоту строки (как у тебя было), ширина = ширина глифа
-                bb_list.append([int(glyph_x0), int(y_cursor), int(gw), int(max(1, line_h))])
-
-                x_cursor += int(adv)
-
-            y_cursor += int(line_h)
-            if line_idx + 1 < len(line_heights):
-                y_cursor += int(line_gap_px)
-
-        # numpy
         txt_arr = np.array(canvas, dtype=np.uint8)
-
-        # бинаризация: лучше OTSU (антиалиас не превращается в "толстый" контур)
-        if txt_arr.size:
-            _, txt_bin = cv2.threshold(txt_arr, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-        else:
-            txt_bin = txt_arr
+        txt_bin = _binarize_text_mask(txt_arr)
 
         # --- опциональная "жирность", но БЕЗ эрозии ---
         stroke = int(getattr(self, "stroke_px", 0))
@@ -595,34 +593,13 @@ class RenderFont(object):
         if base_size >= 26:
             stroke = 0
 
-        if stroke > 0 and txt_bin.size and stroke_mode != "none":
-            k = 2 * stroke + 1
-            kern = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
-
-            if stroke_mode == "dilate":
-                # агрессивно — может склеивать дырки
-                txt_bin = cv2.dilate(txt_bin, kern, iterations=1)
-            else:
-                # ✅ бережный режим: утолщаем границы, дырки живут лучше
-                edge = cv2.morphologyEx(txt_bin, cv2.MORPH_GRADIENT, kern)
-                edge = cv2.dilate(edge, kern, iterations=1)
-                txt_bin = cv2.bitwise_or(txt_bin, edge)
+        txt_bin = _apply_text_stroke(txt_bin, stroke, stroke_mode)
 
         # --- "ширина текста" (горизонтальное растяжение) ---
         widen = float(getattr(self, "text_widen_scale", 1.0))
         if widen is None:
             widen = 1.0
-        widen = float(np.clip(widen, 0.7, 1.6))
-
-        if txt_bin.size and abs(widen - 1.0) > 1e-3:
-            H, W = txt_bin.shape[:2]
-            newW = max(1, int(round(W * widen)))
-            txt_bin = cv2.resize(txt_bin, (newW, H), interpolation=cv2.INTER_NEAREST)
-
-            # поправим bbox-ы по X
-            for i in range(len(bb_list)):
-                bb_list[i][0] = int(round(bb_list[i][0] * widen))
-                bb_list[i][2] = max(1, int(round(bb_list[i][2] * widen)))
+        txt_bin, bb_list = _resize_text_width(txt_bin, bb_list, widen)
 
         txt_str = "\n".join(lines)
         bb_char_xywh = (
@@ -746,55 +723,51 @@ class RenderFont(object):
         H, W = self.robust_HW(mask)
         f_asp = self.font_state.get_aspect_ratio(font)
 
-        # Убираем ограничение на размер шрифта
-        max_font_h = H  # Устанавливаем высоту шрифта равной высоте изображения
+        max_font_h = H
 
         i = 0
         while i < self.max_shrink_trials and max_font_h > self.min_font_h:
             f_h_px = self.sample_font_height_px(self.min_font_h, max_font_h)
             f_h = self.font_state.get_font_size(font, f_h_px)
 
-            max_font_h = f_h_px 
+            max_font_h = f_h_px
             i += 1
 
-            font.size = f_h  # Устанавливаем размер шрифта
-
-            # Убираем ограничение на количество символов
-            nchar = 100  # Временно устанавливаем фиксированное значение
+            font.size = f_h
+            nline, nchar = self.get_nline_nchar(
+                mask.shape[:2],
+                max(float(f_h_px), 1.0),
+                max(float(f_h_px) * float(f_asp), 1.0),
+            )
+            nline = max(1, int(nline))
+            nchar = max(1, min(100, int(nchar)))
 
             text_type = sample_weighted(self.p_text)
             text = self.text_source.sample(nline, nchar, text_type)
             if len(text) == 0 or np.any([len(line) == 0 for line in text]):
                 continue
 
-            # Рендерим текст с фоном
-            background_color = (255, 255, 255)  # Белый фон
-            alpha = 0.5  # Прозрачность фона
-            text_with_background = self.render_with_background(font, text, background_color, alpha)
-
-
             txt_arr, txt, bb = self.render_curved(font, text)
             bb = self.bb_xywh2coords(bb)
 
-            # Размещение текста с фоном внутри маски:
-            text_mask, loc, bb, _ = self.place_text([text_with_background], mask, [bb])
+            text_mask, loc, bb, _ = self.place_text([txt_arr], mask, [bb])
 
             if len(loc) == 0:
                 continue
 
             text_mask = (text_mask > 0).astype(np.uint8) * 255
 
-            if len(loc) > 0:  # Если успешно разместили текст без столкновений:
-                return text_mask, loc[0], bb[0], text
+            if len(loc) > 0:
+                return text_mask, loc[0], bb[0], txt
 
-        return None  # Если не удалось разместить текст
+        return None
 
 
 
     def visualize_bb(self, text_arr, bbs):
         ta = text_arr.copy()
         for r in bbs:
-            cv.rectangle(ta, (r[0],r[1]), (r[0]+r[2],r[1]+r[3]), color=128, thickness=1)
+            cv2.rectangle(ta, (r[0],r[1]), (r[0]+r[2],r[1]+r[3]), color=128, thickness=1)
         plt.imshow(ta,cmap='gray')
         plt.show()
 
@@ -823,25 +796,16 @@ class FontState(object):
         char_freq_path = osp.join(data_dir, 'models/char_freq.cp')        
         font_model_path = osp.join(data_dir, 'models/font_px2pt.cp')
 
-        # get character-frequencies in the English language:
-        with open(char_freq_path,'rb') as f:
-            #self.char_freq = cp.load(f)
-            u = pickle._Unpickler(f)
-            u.encoding = 'latin1'
-            p = u.load()
-            self.char_freq = p
-
-        # get the model to convert from pixel to font pt size:
-        with open(font_model_path,'rb') as f:
-            #self.font_model = cp.load(f)
-            u = pickle._Unpickler(f)
-            u.encoding = 'latin1'
-            p = u.load()
-            self.font_model = p
+        self.char_freq = _load_latin1_pickle(char_freq_path)
+        self.font_model = _load_latin1_pickle(font_model_path)
             
         # get the names of fonts to use:
         self.FONT_LIST = osp.join(data_dir, 'fonts/fontlist.txt')
-        self.fonts = [os.path.join(data_dir,'fonts',f.strip()) for f in open(self.FONT_LIST)]
+        self.fonts = [
+            os.path.join(data_dir, 'fonts', f.strip())
+            for f in open(self.FONT_LIST)
+            if f.strip()
+        ]
 
 
     def get_aspect_ratio(self, font, size=None):
@@ -851,7 +815,7 @@ class FontState(object):
         if size is None:
             size = 12 # doesn't matter as we take the RATIO
         chars = ''.join(self.char_freq.keys())
-        w = np.array(self.char_freq.values())
+        w = np.array(list(self.char_freq.values()), dtype=float)
 
         # get the [height,width] of each character:
         try:
@@ -859,14 +823,19 @@ class FontState(object):
             good_idx = [i for i in range(len(sizes)) if sizes[i] is not None]
             sizes,w = [sizes[i] for i in good_idx], w[good_idx]
             sizes = np.array(sizes).astype('float')[:,[3,4]]        
+            good_size = sizes[:, 0] > 0
+            sizes = sizes[good_size]
+            w = w[good_size]
             r = np.abs(sizes[:,1]/sizes[:,0]) # width/height
             good = np.isfinite(r)
             r = r[good]
             w = w[good]
+            if w.size == 0 or np.sum(w) <= 0:
+                return 1.0
             w /= np.sum(w)
             r_avg = np.sum(w*r)
             return r_avg
-        except:
+        except Exception:
             return 1.0
 
     def get_font_size(self, font, font_size_px):
@@ -950,12 +919,7 @@ class BilingualTextSource(object):
         if p_lang is None:
             p_lang = {k: 1.0 for k in self.langs}
 
-        ps = np.array([float(p_lang.get(k, 0.0)) for k in self.langs], dtype=np.float64)
-        if not np.isfinite(ps).all() or ps.sum() <= 0:
-            ps = np.ones(len(self.langs), dtype=np.float64) / float(len(self.langs))
-        else:
-            ps = ps / ps.sum()
-
+        ps = _normalize_probabilities(self.langs, p_lang)
         self.p_lang = {k: float(ps[i]) for i, k in enumerate(self.langs)}
 
     def _pick_lang(self):

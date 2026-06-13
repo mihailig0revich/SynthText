@@ -5,19 +5,16 @@ This assings the same integer label to all the pixels in the same segment.
 Author: Ankush Gupta
 """
 
-from __future__ import division
 import numpy as np
 import matplotlib.pyplot as plt
 import cv2
-import scipy.io as sio
 import h5py
 import os.path as osp
 import multiprocessing as mp
-import traceback, sys
 
 def get_seed(sx,sy,ucm):
     n = sx.size
-    for i in xrange(n):
+    for i in range(n):
         if ucm[sx[i]+1,sy[i]+1] == 0:
             return (sy[i],sx[i])
 
@@ -41,7 +38,7 @@ def get_mask(ucm,viz=False):
         sx,sy = np.where(mask==0)
         seed = get_seed(sx,sy,ucm)
         i += 1
-    print "  > terminated in %d steps"%i
+    print("  > terminated in %d steps" % i)
 
     if viz:
         plt.imshow(mask)
@@ -53,7 +50,7 @@ def get_mask_parallel(ucm_imname):
     ucm,imname = ucm_imname
     try:
         return (get_mask(ucm.T),imname)
-    except:
+    except Exception:
         return None
         #traceback.print_exc(file=sys.stdout)
 
@@ -78,10 +75,11 @@ def process_db_parallel(base_dir, th=0.11):
             return self
 
         def get_imname(self,i):
-            return "".join(map(chr, self.ucm_h5[self.ucm_h5['names'][0,self.i]][:]))
+            chars = self.ucm_h5[self.ucm_h5['names'][0, i]][:]
+            return "".join(chr(int(c)) for c in chars)
 
         def __stop__(self):
-            print "DONE"
+            print("DONE")
             self.ucm_h5.close()
             raise StopIteration
 
@@ -99,16 +97,18 @@ def process_db_parallel(base_dir, th=0.11):
 
             return imname
 
-        def next(self):
+        def __next__(self):
             imname = self.get_valid_name()
-            print "%d of %d"%(self.i+1,self.N)
+            print("%d of %d" % (self.i + 1, self.N))
             ucm = self.ucm_h5[self.ucm_h5['ucms'][0,self.i]][:]
             ucm = ucm.copy()
             self.i += 1
             return ((ucm>self.th).astype('uint8'),imname)
 
+        next = __next__
+
     ucm_iter = ucm_iterable(db_path,th)
-    print "cpu count: ", mp.cpu_count()
+    print("cpu count: ", mp.cpu_count())
     parpool = mp.Pool(4)
     ucm_result = parpool.imap_unordered(get_mask_parallel, ucm_iter, chunksize=1)
 
@@ -116,17 +116,18 @@ def process_db_parallel(base_dir, th=0.11):
         if res is None:
             continue
         ((mask,area,label),imname) = res
-        print "got back : ", imname
+        print("got back : ", imname)
         mask = mask.astype('uint16')
         mask_dset = dbo_mask.create_dataset(imname, data=mask)
         mask_dset.attrs['area'] = area
         mask_dset.attrs['label'] = label
 
     # close the h5 files:
-    print "closing DB"
+    print("closing DB")
     dbo.close()
-    print ">>>> DONE"
+    print(">>>> DONE")
 
 
-base_dir = '/home/' # directory containing the ucm.mat, i.e., output of run_ucm.m
-process_db_parallel(base_dir)
+if __name__ == '__main__':
+    base_dir = '/home/' # directory containing the ucm.mat, i.e., output of run_ucm.m
+    process_db_parallel(base_dir)

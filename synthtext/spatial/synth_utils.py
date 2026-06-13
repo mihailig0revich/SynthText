@@ -1,9 +1,5 @@
-from __future__ import division
 import numpy as np 
-from ransac import fit_plane_ransac
-from sys import modules
-import matplotlib.pyplot as plt
-from mpl_toolkits.mplot3d import Axes3D
+from .ransac import fit_plane_ransac
 #import mayavi.mlab as mym
 
 
@@ -129,7 +125,7 @@ def ensure_proj_z(plane_coeffs, min_z_proj):
         return coeffs
     return plane_coeffs
 
-def isplanar(xyz, sample_neighbors, dist_thresh, num_inliers, z_proj):
+def isplanar(xyz, sample_neighbors, dist_thresh, num_inliers, z_proj, debug=False, debug_prefix="[RANSAC]", nsample=20):
     """
     Checks if at-least FRAC_INLIERS fraction of points of XYZ (nx3)
     points lie on a plane. The plane is fit using RANSAC.
@@ -145,9 +141,15 @@ def isplanar(xyz, sample_neighbors, dist_thresh, num_inliers, z_proj):
         None, if the data is not planar, else a 4-tuple of plane coeffs.
     """
     import numpy as np
+    debug = bool(debug)
+
+    def _log(msg):
+        if debug:
+            print(f"{debug_prefix} {msg}")
 
     xyz = np.asarray(xyz, dtype=np.float64)
     if xyz.ndim != 2 or xyz.shape[1] != 3:
+        _log(f"reject in isplanar: bad xyz shape={xyz.shape}")
         return
 
     # чистим NaN/Inf
@@ -157,6 +159,7 @@ def isplanar(xyz, sample_neighbors, dist_thresh, num_inliers, z_proj):
     N = xyz.shape[0]
     if N < 10:
         # слишком мало точек, чтобы уверенно фитить плоскость
+        _log(f"reject in isplanar: too few points N={N}")
         return
 
     # интерпретируем num_inliers:
@@ -168,13 +171,18 @@ def isplanar(xyz, sample_neighbors, dist_thresh, num_inliers, z_proj):
     else:
         frac_inliers = frac_inliers / float(N)
 
-    # не даём доле уйти в 0.0 или 1.0
-    frac_inliers = float(np.clip(frac_inliers, 0.1, 0.9))
+    # не даём доле уйти в 0.0 или 1.0, но разрешаем мягкие пороги для шумных depth-карт.
+    frac_inliers = float(np.clip(frac_inliers, 0.05, 0.9))
 
     # выравниваем нормаль в сторону камеры
     dv = -np.percentile(xyz, 50, axis=0)
 
     max_iter = int(sample_neighbors.shape[-1])
+    _log(
+        f"isplanar: N={N}, sample_neighbors_shape={getattr(sample_neighbors, 'shape', None)}, "
+        f"dist_thresh={float(dist_thresh):.4f}, requested_num_inliers={num_inliers}, nsample={int(nsample)}, "
+        f"effective_frac={float(frac_inliers):.3f}, z_proj={float(z_proj):.4f}, max_iter={max_iter}"
+    )
 
     try:
         plane_info = fit_plane_ransac(
@@ -183,18 +191,25 @@ def isplanar(xyz, sample_neighbors, dist_thresh, num_inliers, z_proj):
             z_pos=dv,
             dist_inlier=dist_thresh,
             min_inlier_frac=frac_inliers,
-            nsample=20,
-            max_iter=max_iter
+            nsample=int(nsample),
+            max_iter=max_iter,
+            debug=debug,
+            debug_prefix=debug_prefix,
         )
-    except Exception:
+    except Exception as exc:
         # тут раньше всё и падало -> просто говорим "непланарно"
+        _log(f"exception in fit_plane_ransac: {repr(exc)}")
         return
 
     if plane_info is None:
+        _log("isplanar result: None")
         return
 
     coeff, inliers = plane_info
     coeff = ensure_proj_z(coeff, z_proj)
+    if debug:
+        nin = int(np.asarray(inliers).sum()) if np.asarray(inliers).dtype == np.bool_ else len(inliers)
+        _log(f"isplanar accepted: inliers={nin}/{N}, coeff={np.asarray(coeff)}")
     return coeff, inliers
 
 

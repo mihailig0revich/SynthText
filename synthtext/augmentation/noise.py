@@ -4,7 +4,7 @@ from typing import List, Optional, Tuple
 
 # Если у тебя есть свои аугментации из transforms, импорт оставляем.
 try:
-    from transforms import aug_rotate, aug_perspective
+    from .transforms import aug_rotate, aug_perspective
 except ImportError:
     aug_rotate = None
     aug_perspective = None

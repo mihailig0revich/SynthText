@@ -6,7 +6,6 @@ http://web.media.mit.edu/~raskar/photo/code.pdf
 Adapted slightly for doing "mixed" Poisson Image Editing [Perez et al.]
 Paper: http://www.cs.jhu.edu/~misha/Fall07/Papers/Perez03.pdf
 """
-from __future__ import division
 import numpy as np 
 import scipy.fftpack
 import scipy.ndimage
@@ -168,14 +167,13 @@ if __name__=='__main__':
     """
     example usage:
     """
-    import seaborn as sns
+    from PIL import Image
 
     im_src = cv2.imread('i2.jpg').astype('float32')
 
     im_dst = cv2.imread('gg.jpg').astype('float32')
 
     mu = np.mean(np.reshape(im_src,[im_src.shape[0]*im_src.shape[1],3]),axis=0)
-    # print mu
     sz = (700,700)
     im_src = cv2.resize(im_src,sz)
     im_dst = cv2.resize(im_dst,sz)
@@ -192,14 +190,13 @@ if __name__=='__main__':
 
     im_res = blit_images(im_src,im_dst)
 
-    import scipy
-    scipy.misc.imsave('orig.png',im_src[:,:,::-1].astype('uint8'))
-    scipy.misc.imsave('alpha.png',im_alpha[:,:,::-1].astype('uint8'))
-    scipy.misc.imsave('poisson.png',im_res[:,:,::-1].astype('uint8'))
+    Image.fromarray(im_src[:,:,::-1].astype('uint8')).save('orig.png')
+    Image.fromarray(im_alpha[:,:,::-1].astype('uint8')).save('alpha.png')
+    Image.fromarray(im_res[:,:,::-1].astype('uint8')).save('poisson.png')
 
-    im_actual_L = cv2.cvtColor(im_src.astype('uint8'),cv2.cv.CV_BGR2Lab)[:,:,0]
-    im_alpha_L = cv2.cvtColor(im_alpha.astype('uint8'),cv2.cv.CV_BGR2Lab)[:,:,0]
-    im_poisson_L = cv2.cvtColor(im_res.astype('uint8'),cv2.cv.CV_BGR2Lab)[:,:,0]
+    im_actual_L = cv2.cvtColor(im_src.astype('uint8'), cv2.COLOR_BGR2Lab)[:, :, 0]
+    im_alpha_L = cv2.cvtColor(im_alpha.astype('uint8'), cv2.COLOR_BGR2Lab)[:, :, 0]
+    im_poisson_L = cv2.cvtColor(im_res.astype('uint8'), cv2.COLOR_BGR2Lab)[:, :, 0]
 
     # plt.imshow(im_alpha_L)
     # plt.show()
@@ -209,7 +206,7 @@ if __name__=='__main__':
         l_poisson = im_poisson_L[i,:]#-im_poisson_L[i,:-1]
 
 
-        with sns.axes_style("darkgrid"):
+        with plt.style.context("ggplot"):
             plt.subplot(2,1,2)
             plt.plot(l_alpha,label='alpha')
             plt.plot(l_poisson,label='poisson')
@@ -223,7 +220,7 @@ if __name__=='__main__':
             for b0,b1 in t_loc:
                 ax.axvspan(b0, b1, facecolor='red', alpha=0.1)
         
-        with sns.axes_style("white"):
+        with plt.style.context("default"):
             plt.subplot(2,1,1)
             plt.imshow(im_alpha[:,:,::-1].astype('uint8'))
             plt.plot([0,im_alpha_L.shape[0]-1],[i,i],'r')
@@ -238,5 +235,3 @@ if __name__=='__main__':
     plt.subplot(1,3,3)    
     plt.imshow(im_res[:,:,::-1]) #cv2 reads in BGR
     plt.show()
-
-
